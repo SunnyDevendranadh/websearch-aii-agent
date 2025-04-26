@@ -13,6 +13,7 @@ from .market_research_core_py import (
     process_markdown,
     format_report,
     parse_report_metadata,
+    clean_escape_sequences,
     RUST_CORE_AVAILABLE
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     'process_markdown',
     'format_report',
     'parse_report_metadata',
+    'clean_escape_sequences',
     'RUST_CORE_AVAILABLE'
 ]
 

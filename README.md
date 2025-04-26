@@ -17,6 +17,7 @@ This CLI tool combines the ease and flexibility of Python with the speed and eff
 - **Modern TUI Interface**: Rich text-based UI with progress tracking and interactive menus
 - **Hybrid Architecture**: Seamless fallback to Python implementations when Rust is unavailable
 - **SMS Notification**: Optional SMS delivery of report summaries via Twilio integration
+- **Beautiful Report Formatting**: Professionally styled reports with consistent headings, tables, and visual elements
 
 ## Project Structure
 
@@ -27,21 +28,21 @@ market-research-cli/
 │   │   ├── src/                   # Rust source code
 │   │   │   └── lib.rs             # Rust library with performance-critical functions
 │   │   ├── Cargo.toml             # Rust package configuration
-│   ├── market_research_core_py/   # Python wrapper for Rust core
-│   │   ├── __init__.py            # Python package initialization
-│   │   ├── market_research_core_py.py # Python fallback implementations
-│   │   ├── setup.py               # Python package setup
-│   ├── web_search/                # Web search integration
-│   │   ├── __init__.py            # Package initialization
-│   │   ├── brave_search.py        # Brave Search API implementation
-│   ├── fast_cli.py                # Main CLI entry point
-├── reports/                       # Directory for generated reports
-├── setup.sh                       # Unix/Linux/macOS setup script
-├── setup.bat                      # Windows setup script
-├── run.sh                         # Unix/Linux/macOS run script
-├── run.bat                        # Windows run script
-├── requirements.txt               # Python dependencies
-└── README.md                      # This file
+│   │   ├── market_research_core_py/   # Python wrapper for Rust core
+│   │   │   ├── __init__.py            # Python package initialization
+│   │   │   ├── market_research_core_py.py # Python fallback implementations
+│   │   │   ├── setup.py               # Python package setup
+│   │   ├── web_search/                # Web search integration
+│   │   │   ├── __init__.py            # Package initialization
+│   │   │   ├── brave_search.py        # Brave Search API implementation
+│   │   ├── fast_cli.py                # Main CLI entry point
+│   ├── reports/                       # Directory for generated reports
+│   ├── setup.sh                       # Unix/Linux/macOS setup script
+│   ├── setup.bat                      # Windows setup script
+│   ├── run.sh                         # Unix/Linux/macOS run script
+│   ├── run.bat                        # Windows run script
+│   ├── requirements.txt               # Python dependencies
+│   └── README.md                      # This file
 ```
 
 ## Performance Improvements
@@ -65,6 +66,8 @@ The Rust-accelerated version provides significant performance improvements:
 4. **Web Search Integration**: The application can query the Brave Search API to enhance reports with real-time information, making your reports more accurate and up-to-date.
 
 5. **Report Structure**: Each report follows a comprehensive structure covering market trends, competitor analysis, target audience, market size, growth potential, risks, and strategic recommendations.
+
+6. **Beautiful Formatting**: The Rust core applies consistent formatting rules to ensure reports have professional styling with proper hierarchy, spacing, and visual elements.
 
 ## Installation
 
@@ -185,6 +188,41 @@ The CLI uses the Brave Search API to enhance reports with real-time information:
    - Better insights on emerging trends and recent developments
 
 4. **Extension**: The system uses a modular design that can be extended to other search providers beyond Brave Search.
+
+## Report Formatting
+
+The CLI generates beautifully formatted reports that are ready for professional use:
+
+1. **Consistent Structure**:
+
+   - Clear hierarchical organization with properly nested sections and subsections
+   - Table of contents with clickable links to each major section
+   - Executive summary at the beginning and strategic recommendations at the end
+
+2. **Professional Styling**:
+
+   - Properly formatted headings with hierarchical numbering (H1, H2, H3)
+   - Consistent font styling and spacing throughout the document
+   - Clean tables with proper alignment and borders for data presentation
+   - Bulleted and numbered lists for easy readability
+
+3. **Visual Elements**:
+
+   - Automatic inclusion of relevant charts and graphs when data is present
+   - Proper code block formatting for technical sections
+   - Block quotes to highlight important findings or quotes
+   - Horizontal rules to separate major sections
+
+4. **Export Options**:
+
+   - Generated in markdown format for maximum compatibility
+   - Can be easily converted to PDF or HTML using included utility scripts
+   - Print-friendly layout that preserves formatting when printed
+
+5. **Customization**:
+   - Template system allows for company branding and custom styling
+   - Configurable heading styles and document structure
+   - Optional inclusion of date, author, and company information
 
 ## Contributing
 

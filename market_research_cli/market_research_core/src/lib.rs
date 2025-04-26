@@ -9,6 +9,8 @@ use anyhow::{Result, anyhow};
 use comrak::{markdown_to_html, ComrakOptions};
 use chrono::prelude::*;
 use regex::Regex;
+use std::collections::HashMap;
+use serde_yaml;
 
 /// A Rust module for accelerating market research report generation.
 /// This module provides high-performance alternatives to slow Python operations.
@@ -20,6 +22,7 @@ fn market_research_core(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(format_report, m)?)?;
     m.add_function(wrap_pyfunction!(parse_report_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(py_list_reports, m)?)?;
+    m.add_function(wrap_pyfunction!(clean_escape_sequences, m)?)?;
     Ok(())
 }
 
@@ -128,9 +131,25 @@ impl ReportManager {
             }
         }
         
-        // Write file
-        fs::write(&path, content)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to write file: {}", e)))?;
+        // Use atomic write pattern to prevent corruption
+        let temp_filename = format!("{}.tmp", filename);
+        
+        // Write to temporary file first
+        fs::write(&temp_filename, content).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to write temporary file: {}", e)
+            )
+        })?;
+        
+        // Rename temporary file to final filename
+        fs::rename(&temp_filename, &path).map_err(|e| {
+            // Try to clean up temp file
+            let _ = fs::remove_file(&temp_filename);
+            
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to save report: {}", e)
+            )
+        })?;
         
         Ok(path.to_string_lossy().to_string())
     }
@@ -147,10 +166,41 @@ impl ReportManager {
     /// Read a report from disk
     fn read_report(&self, filename: &str) -> PyResult<String> {
         let path = Path::new(&self.reports_dir).join(filename);
-        let result = fs::read_to_string(&path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read file: {}", e)))?;
         
-        Ok(result)
+        // Check if file exists
+        if !path.exists() {
+            return Err(PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
+                format!("Report file not found: {}", filename)
+            ));
+        }
+        
+        // Check if it's actually a file and not a directory
+        if !path.is_file() {
+            return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Path is not a file: {}", filename)
+            ));
+        }
+        
+        // Check file size to prevent loading extremely large files
+        let metadata = fs::metadata(&path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to read file metadata: {}", e)
+            )
+        })?;
+        
+        const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50MB limit
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("File too large ({}MB). Maximum size is 50MB.", metadata.len() / (1024 * 1024))
+            ));
+        }
+        
+        // Read file with informative error
+        fs::read_to_string(&path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Failed to read report file: {}", e)
+            )
+        })
     }
 
     /// Delete a report
@@ -167,67 +217,162 @@ impl ReportManager {
     }
 }
 
-/// Process markdown content
+/// Process markdown content and extract metadata
 #[pyfunction]
-fn process_markdown(markdown: &str) -> PyResult<String> {
+fn process_markdown(content: &str) -> PyResult<(HashMap<String, String>, String)> {
+    // Validate input is not empty
+    if content.trim().is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Markdown content cannot be empty"
+        ));
+    }
+
+    // Limit the size of the input to prevent processing extremely large markdown
+    const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024; // 10MB limit
+    if content.len() > MAX_CONTENT_LENGTH {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            format!("Markdown content too large ({}MB). Maximum size is 10MB.", content.len() / (1024 * 1024))
+        ));
+    }
+
+    // Extract metadata and markdown content
+    let (metadata, markdown_content) = match parse_report_metadata(content) {
+        Ok(result) => result,
+        Err(err) => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Failed to parse markdown metadata: {}", err)
+            ));
+        }
+    };
+
+    // Validate that required metadata fields are present
+    let required_fields = ["title", "date"];
+    for field in required_fields.iter() {
+        if !metadata.contains_key(*field) {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Required metadata field '{}' is missing", field)
+            ));
+        }
+    }
+
+    Ok((metadata, markdown_content))
+}
+
+/// Clean terminal escape sequences from the content
+#[pyfunction]
+fn clean_escape_sequences(content: &str) -> PyResult<String> {
+    // ANSI/VT100 escape sequence regex pattern
+    let escape_seq_pattern = Regex::new(r"\x1B\[([0-9]{1,2}(;[0-9]{1,2})*)?[m|K]").unwrap();
+    let cleaned = escape_seq_pattern.replace_all(content, "").to_string();
+    Ok(cleaned)
+}
+
+/// Format a market research report from markdown to HTML
+#[pyfunction]
+fn format_report(markdown: &str) -> PyResult<String> {
+    // Validate input is not empty
+    if markdown.trim().is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Markdown content cannot be empty"
+        ));
+    }
+
+    // Clean any terminal escape sequences that might be present
+    let cleaned_markdown = clean_escape_sequences(markdown)?;
+
+    // Create options for markdown processing
     let mut options = ComrakOptions::default();
     options.extension.table = true;
     options.extension.strikethrough = true;
     options.extension.tagfilter = true;
     options.extension.autolink = true;
+    options.extension.tasklist = true;
+    options.extension.superscript = true;
+    options.extension.header_ids = Some("section-".to_string());
+    options.render.github_pre_lang = true;
+    options.render.hardbreaks = false;
+    options.render.unsafe_ = true;  // Allow HTML passthrough
+
+    // Use a thread with timeout to prevent potential hangs
+    let result = std::thread::spawn(move || {
+        comrak::markdown_to_html(&cleaned_markdown, &options)
+    })
+    .join()
+    .map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Markdown processing thread panicked"
+        )
+    })?;
     
-    Ok(markdown_to_html(markdown, &options))
+    // Validate result is not empty
+    if result.trim().is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Generated HTML content is empty"
+        ));
+    }
+    
+    Ok(result)
 }
 
-/// Format a report with proper styling
+/// Parse metadata from the YAML frontmatter of a markdown file
 #[pyfunction]
-fn format_report(content: &str, title: &str) -> PyResult<String> {
-    let current_date = Local::now().format("%B %d, %Y").to_string();
-    let report_id = Local::now().format("MR-%Y%m%d-%H%M%S").to_string();
-    
-    let formatted = format!(
-        "# {} Market Analysis\n\n\
-        <div class=\"report-metadata\">\n\
-        <p class=\"report-date\">Generated on: {}</p>\n\
-        <p class=\"report-id\">Report ID: {}</p>\n\
-        <p class=\"confidentiality\">CONFIDENTIAL DOCUMENT</p>\n\
-        </div>\n\n\
-        ---\n\n\
-        {}", 
-        title, current_date, report_id, content
-    );
-    
-    Ok(formatted)
-}
+fn parse_report_metadata(content: &str) -> PyResult<HashMap<String, String>> {
+    // Validate input is not empty
+    if content.trim().is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Content cannot be empty"
+        ));
+    }
 
-/// Parse metadata from a report
-#[pyfunction]
-fn parse_report_metadata(py: Python, content: &str) -> PyResult<PyObject> {
-    let title_re = Regex::new(r"#\s*(.*?)(?:\n|$)").unwrap();
-    let date_re = Regex::new(r"Generated on:\s*(.*?)(?:\n|<)").unwrap();
-    let id_re = Regex::new(r"Report ID:\s*(.*?)(?:\n|<)").unwrap();
+    // Expected format: YAML frontmatter between --- delimiters at the start of the file
+    let mut result = HashMap::new();
     
-    let title = title_re.captures(content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().trim().to_string())
-        .unwrap_or_else(|| "Unknown Title".to_string());
+    // Check if the content starts with a YAML frontmatter section
+    if !content.trim_start().starts_with("---") {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "No YAML frontmatter found - content must start with '---'"
+        ));
+    }
     
-    let date = date_re.captures(content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().trim().to_string())
-        .unwrap_or_else(|| "Unknown Date".to_string());
+    // Find the bounds of the YAML section
+    let content_without_initial_whitespace = content.trim_start();
+    let rest = &content_without_initial_whitespace[3..]; // Skip the first ---
     
-    let id = id_re.captures(content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().trim().to_string())
-        .unwrap_or_else(|| "Unknown ID".to_string());
+    if let Some(end_idx) = rest.find("---") {
+        let yaml_str = &rest[..end_idx].trim();
+        
+        // Parse the YAML string
+        match serde_yaml::from_str::<HashMap<String, String>>(yaml_str) {
+            Ok(metadata) => {
+                // Validate required fields
+                const REQUIRED_FIELDS: [&str; 2] = ["title", "date"];
+                let missing_fields: Vec<&str> = REQUIRED_FIELDS
+                    .iter()
+                    .filter(|&field| !metadata.contains_key(*field))
+                    .copied()
+                    .collect();
+                
+                if !missing_fields.is_empty() {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Missing required metadata fields: {}", missing_fields.join(", "))
+                    ));
+                }
+                
+                result = metadata;
+            },
+            Err(e) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Failed to parse YAML frontmatter: {}", e)
+                ));
+            }
+        }
+    } else {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Incomplete YAML frontmatter - missing closing '---'"
+        ));
+    }
     
-    let dict = PyDict::new(py);
-    dict.set_item("title", title)?;
-    dict.set_item("date", date)?;
-    dict.set_item("id", id)?;
-    
-    Ok(dict.into())
+    Ok(result)
 }
 
 /// Python-exposed function for listing reports

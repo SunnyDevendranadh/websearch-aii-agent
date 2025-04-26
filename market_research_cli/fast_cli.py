@@ -7,6 +7,7 @@ import threading
 from datetime import datetime
 from typing import Dict, List, Optional
 from pathlib import Path
+import re
 
 # Load environment variables first
 from dotenv import load_dotenv
@@ -43,6 +44,7 @@ try:
         process_markdown,
         format_report,
         parse_report_metadata,
+        clean_escape_sequences,
         RUST_CORE_AVAILABLE
     )
     is_rust_enabled = RUST_CORE_AVAILABLE
@@ -133,7 +135,24 @@ else:
             self.dir.mkdir(exist_ok=True)
 
         def save_report(self, filename, content):
+            """Save a report to disk"""
             path = self.dir / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Clean any ANSI escape sequences that might be in the content
+            try:
+                # Always use the Python wrapper which has proper fallback handling
+                content = clean_escape_sequences(content)
+            except Exception as e:
+                print(f"Warning: Could not use clean_escape_sequences: {e}. Using direct regex.")
+                try:
+                    # More comprehensive ANSI/VT100 escape sequence pattern
+                    # This captures both actual escape characters and text representations like "ESC["
+                    escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+                    content = escape_seq_pattern.sub('', content)
+                except Exception as inner_e:
+                    print(f"Warning: Could not clean escape sequences: {inner_e}")
+                
             path.write_text(content, encoding='utf-8')
             return str(path)
 
@@ -170,6 +189,21 @@ date: {timestamp}
 Generated on: {timestamp}
 
 """
+        # Clean any ANSI escape sequences that might be in the content
+        try:
+            # Try to use the Python wrapper function first
+            content = clean_escape_sequences(content)
+        except Exception as e:
+            print(f"Warning: Could not use clean_escape_sequences in format_report: {e}. Using direct regex.")
+            # Use regex directly for cleaning
+            try:
+                # More comprehensive ANSI/VT100 escape sequence pattern
+                # This captures both actual escape characters and text representations like "ESC["
+                escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+                content = escape_seq_pattern.sub('', content)
+            except Exception as inner_e:
+                print(f"Warning: Could not clean escape sequences in format_report: {inner_e}")
+            
         return header + content
 
     def parse_report_metadata(content):
@@ -613,7 +647,9 @@ def generate_market_research_report(topic: str, progress_callback=None, model_pr
                 # Simulate work / actual processing delay
                 time.sleep(0.2 + random.random() * 0.5 if is_rust_enabled else 0.4 + random.random() * 0.8) # Slightly faster simulation
                 activity_progress = base_progress + ((j + 1) / len(activities)) * (100 / len(stages)) # More accurate activity progress scaling
-                activity_progress = min(activity_progress, 99.9) # Cap below 100 until final step
+                # Only cap progress at 99.9% if we're not on the last stage and last activity
+                if i < len(stages) - 1 or j < len(activities) - 1:
+                    activity_progress = min(activity_progress, 99.9) # Cap below 100 until final stage & activity
                 if progress_callback:
                     progress_callback(activity_progress, stage_name, agent_name, activity)
 
@@ -672,6 +708,18 @@ This report is generated with AI assistance. While efforts are made to ensure ac
 )
 
         full_report = "".join(report_sections)
+
+        # Clean any ANSI escape sequences that might be in the report
+        try:
+            # Always use the Python wrapper which has proper fallback handling
+            full_report = clean_escape_sequences(full_report)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not use clean_escape_sequences: {str(e)}. Using direct regex.[/yellow]")
+            try:
+                escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+                full_report = escape_seq_pattern.sub('', full_report)
+            except Exception as inner_e:
+                console.print(f"[yellow]Warning: Could not clean escape sequences: {str(inner_e)}[/yellow]")
 
         # Optional Rust final processing (if you implement specific formatting there)
         if is_rust_enabled:
@@ -1653,6 +1701,20 @@ def view_report(report_path: Path, console: Console) -> None:
 
     try:
         content = report_path.read_text(encoding='utf-8')
+        
+        # Clean any ANSI escape sequences that might be present in the content
+        try:
+            # Always use the Python wrapper which has proper fallback handling
+            content = clean_escape_sequences(content)
+        except Exception as e:
+            # If even that fails, try direct regex cleaning
+            console.print(f"[yellow]Warning: Could not use clean_escape_sequences: {str(e)}. Using direct regex.[/yellow]")
+            try:
+                escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+                content = escape_seq_pattern.sub('', content)
+            except Exception as inner_e:
+                console.print(f"[yellow]Warning: Could not clean escape sequences: {str(inner_e)}[/yellow]")
+            
         metadata = parse_report_metadata(content) # Use Rust/Python parser
         title = metadata.get("title", report_path.stem)
         date = metadata.get("date", "N/A")
@@ -1676,6 +1738,7 @@ def view_report(report_path: Path, console: Console) -> None:
 
     except Exception as e:
         console.print(f"[bold red]Error reading or displaying report {report_path.name}: {str(e)}[/bold red]")
+        console.print_exception(show_locals=False) # Show traceback for debugging
 
 
 def send_report_via_sms(report_path: Path, phone_number: str) -> tuple[bool, str]:

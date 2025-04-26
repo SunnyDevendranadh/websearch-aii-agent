@@ -9,6 +9,7 @@ import os
 import json
 import time
 import datetime
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 
@@ -187,4 +188,27 @@ def parse_report_metadata(content: str) -> Dict[str, str]:
             "title": title,
             "date": date,
             "id": id
-        } 
+        }
+
+def clean_escape_sequences(content: str) -> str:
+    """Clean terminal escape sequences from the content"""
+    if RUST_CORE_AVAILABLE:
+        try:
+            # Try to call the Rust function, but fall back to Python if it's not available
+            if hasattr(market_research_core, 'clean_escape_sequences'):
+                return market_research_core.clean_escape_sequences(content)
+            else:
+                # Fall back to Python implementation if Rust function doesn't exist
+                # Include more comprehensive pattern to match all escape sequences including ESC[
+                escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+                return escape_seq_pattern.sub('', content)
+        except Exception as e:
+            # Fall back to Python implementation if there's any error with the Rust version
+            print(f"Warning: Error using Rust clean_escape_sequences: {e}, falling back to Python implementation")
+            escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+            return escape_seq_pattern.sub('', content)
+    else:
+        # More comprehensive ANSI/VT100 escape sequence pattern
+        # This captures both actual escape characters and text representations like "ESC["
+        escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+        return escape_seq_pattern.sub('', content) 
