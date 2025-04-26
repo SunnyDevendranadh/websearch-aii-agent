@@ -911,6 +911,19 @@ class FastCLI:
         spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         spinner_idx = 0
         current_model_display = "N/A" # For display
+        
+        # Define the display-only version of stages for UI updates
+        # This is only used for UI display purposes, not for actual report generation
+        display_stages = [
+            {"name": "Analyzing market trends", "preferred_model": "openai"},
+            {"name": "Gathering competitor data", "preferred_model": "claude"},
+            {"name": "Identifying target audience", "preferred_model": "openai"},
+            {"name": "Evaluating market size", "preferred_model": "claude"},
+            {"name": "Analyzing growth potential", "preferred_model": "openai"},
+            {"name": "Identifying risks and challenges", "preferred_model": "claude"},
+            {"name": "Generating recommendations", "preferred_model": "openai"},
+            {"name": "Generating Executive Summary", "preferred_model": "claude"}
+        ]
 
         # Define progress update callback (keep existing logic, maybe add model info)
         def update_progress(percentage, stage, agent, activity):
@@ -920,7 +933,7 @@ class FastCLI:
             # Determine which model is likely being used for display purposes
             # Note: This is just for display, the actual model used is determined in generate_market_research_report
             stage_pref = "openai" # Find the stage pref if needed for display
-            for s in stages: # Quick loop to find pref for display
+            for s in display_stages: # Use the local display_stages instead of the global stages
                  if s["name"] == stage:
                       stage_pref = s.get("preferred_model", "openai")
                       break
@@ -931,7 +944,7 @@ class FastCLI:
 
             # Simulate stats updates (keep existing logic)
             if stage != "Initializing":
-                 report_stats["sections_completed"] = int((percentage / 100) * len(stages)) # Use len(stages)
+                 report_stats["sections_completed"] = int((percentage / 100) * len(display_stages)) # Use display_stages length
                  report_stats["words_generated"] = int((percentage / 100) * 2500) + random.randint(-100, 100)
                  report_stats["data_points"] = int((percentage / 100) * 45) + random.randint(-3, 3)
                  report_stats["charts"] = int((percentage / 100) * 7) # Placeholder
@@ -972,7 +985,7 @@ class FastCLI:
                             layout["header"].update(Panel(header_text, border_style="blue"))
 
                             # Stats
-                            stats_text = f"[b]Sections:[/b] {report_stats['sections_completed']}/{len(stages)} | [b]Words:[/b] ~{report_stats['words_generated']} | [b]Data:[/b] {report_stats['data_points']} | [b]Charts:[/b] {report_stats['charts']}"
+                            stats_text = f"[b]Sections:[/b] {report_stats['sections_completed']}/{len(display_stages)} | [b]Words:[/b] ~{report_stats['words_generated']} | [b]Data:[/b] {report_stats['data_points']} | [b]Charts:[/b] {report_stats['charts']}"
                             layout["stats"].update(Text.from_markup(stats_text))
 
                             # Progress Bar
@@ -1275,7 +1288,10 @@ class FastCLI:
 
 
     def settings(self) -> None:
-        """Configure application settings like API keys."""
+        """Configure application settings."""
+        global CLAUDE_AVAILABLE, CLAUDE_API_KEY, CLAUDE_MESSAGES_API_AVAILABLE, claude_client
+        global TWILIO_AVAILABLE, TWILIO_ENABLED, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
+        
         while True:
             options = []
             # OpenAI
@@ -1288,6 +1304,10 @@ class FastCLI:
             claude_lib_status = "[green]Installed[/green]" if CLAUDE_AVAILABLE else "[red]Not Installed[/red]"
             claude_key_status = "[green]Set[/green]" if claude_key else "[yellow]Not Set[/yellow]"
             options.append(f"Claude API Key ({claude_key_status}, Lib: {claude_lib_status})")
+            
+            # Add dedicated option for installing Anthropic library
+            anthropic_install_option = "Install Anthropic Library" if not CLAUDE_AVAILABLE else "Update Anthropic Library"
+            options.append(f"{anthropic_install_option} (Current: {claude_lib_status})")
 
             # Brave Search
             brave_key = os.getenv("BRAVE_API_KEY")
@@ -1348,6 +1368,18 @@ class FastCLI:
                      claude_client = None # Clear client if key removed or lib unavailable
                      CLAUDE_MESSAGES_API_AVAILABLE = False
 
+            elif choice.startswith("Install Anthropic Library") or choice.startswith("Update Anthropic Library"):
+                # Direct option to install/update the Anthropic library
+                self._install_anthropic_package()
+                # After installation, check if we need to initialize the client
+                if CLAUDE_AVAILABLE and CLAUDE_API_KEY and not claude_client:
+                    try:
+                        import anthropic
+                        claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+                        CLAUDE_MESSAGES_API_AVAILABLE = hasattr(claude_client, "messages") and callable(getattr(claude_client.messages, "create", None))
+                        console.print("[green]Claude client initialized after package installation.[/green]")
+                    except Exception as e:
+                        console.print(f"[red]Could not initialize Claude client after installation: {e}[/red]")
 
             elif choice.startswith("Brave Search API Key"):
                  if not WEB_SEARCH_AVAILABLE:
@@ -1481,25 +1513,88 @@ class FastCLI:
 
     def _install_anthropic_package(self):
         """Attempt to install the Anthropic (Claude) package."""
-        global CLAUDE_AVAILABLE
+        global CLAUDE_AVAILABLE, CLAUDE_API_KEY, CLAUDE_MESSAGES_API_AVAILABLE, claude_client
+        
+        console.print("\n[bold cyan]===== Anthropic Library Installation =====")
+        console.print("[yellow]This will install or update the 'anthropic' Python package required for Claude AI.[/yellow]")
+        
+        # Display current status
+        try:
+            import pkg_resources
+            try:
+                current_version = pkg_resources.get_distribution("anthropic").version
+                console.print(f"[cyan]Current installed version: v{current_version}[/cyan]")
+            except pkg_resources.DistributionNotFound:
+                console.print("[yellow]Status: Not currently installed[/yellow]")
+        except ImportError:
+            console.print("[yellow]Status: Package information unavailable[/yellow]")
+            
         console.print("[cyan]Attempting to install 'anthropic' library using pip...[/cyan]")
         try:
             import subprocess
             import sys
+            
+            # Show installation progress
+            console.print("[cyan]Running: pip install -U anthropic[/cyan]")
+            
             # Use check_call to raise error if install fails
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "anthropic"]) # -U to upgrade
-            console.print("[bold green]✓ Successfully installed/updated 'anthropic' package![/bold green]")
-            console.print("[yellow]Please restart the application for changes to take full effect, then configure the API key in Settings.[/yellow]")
-            # Note: Updating global state here might not fully work without restart
-            global CLAUDE_AVAILABLE
-            CLAUDE_AVAILABLE = True # Assume success for now, restart clarifies
-            time.sleep(2) # Pause to let user read
+            result = subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "anthropic"]) # -U to upgrade
+            
+            # Check the installed version after installation
+            try:
+                import pkg_resources
+                import importlib
+                # Reload if it was already imported
+                if "anthropic" in sys.modules:
+                    importlib.reload(sys.modules["anthropic"])
+                new_version = pkg_resources.get_distribution("anthropic").version
+                console.print(f"[bold green]✓ Successfully installed/updated 'anthropic' package to v{new_version}![/bold green]")
+            except Exception:
+                console.print("[bold green]✓ Successfully installed/updated 'anthropic' package![/bold green]")
+                
+            # Import anthropic to check if it works
+            try:
+                import anthropic
+                console.print("[green]✓ Successfully imported 'anthropic' module[/green]")
+                CLAUDE_AVAILABLE = True
+                
+                # Check for the Messages API capabilities
+                if hasattr(anthropic, "Anthropic"):
+                    console.print("[green]✓ Modern Anthropic client detected[/green]")
+                    if CLAUDE_API_KEY:
+                        console.print("[cyan]Attempting to initialize client with your API key...[/cyan]")
+                        try:
+                            claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+                            if hasattr(claude_client, "messages") and callable(getattr(claude_client.messages, "create", None)):
+                                CLAUDE_MESSAGES_API_AVAILABLE = True
+                                console.print("[bold green]✓ Claude Messages API is available and ready to use![/bold green]")
+                            else:
+                                console.print("[yellow]⚠ Claude Messages API not detected. You may need a newer version.[/yellow]")
+                        except Exception as e:
+                            console.print(f"[yellow]⚠ Could not initialize Claude client: {e}[/yellow]")
+                    else:
+                        console.print("[yellow]⚠ Claude API key not set. Please set it to use Claude.[/yellow]")
+                else:
+                    console.print("[yellow]⚠ Unexpected Anthropic library structure. Check for updates.[/yellow]")
+                    
+            except ImportError:
+                console.print("[yellow]⚠ Package installed but import failed. This is unexpected.[/yellow]")
+                CLAUDE_AVAILABLE = False
+                
+            console.print("[yellow]You may need to restart the application for changes to take full effect.[/yellow]")
+            time.sleep(1) # Pause to let user read
 
         except subprocess.CalledProcessError as e:
-            console.print(f"[bold red]Failed to install 'anthropic': Pip command failed. {e}[/bold red]")
+            console.print(f"[bold red]Failed to install 'anthropic': Pip command failed with error code {e.returncode}[/bold red]")
+            console.print(f"[red]Error details: {e}[/red]")
+            if e.returncode == 1:
+                console.print("[yellow]This might be due to network issues, permissions, or PyPI being unavailable.[/yellow]")
         except Exception as e:
             console.print(f"[bold red]An unexpected error occurred during installation: {str(e)}[/bold red]")
-            console.print("[yellow]You may need to install it manually: pip install --upgrade anthropic[/yellow]")
+            console.print("[yellow]You may need to install it manually with: pip install --upgrade anthropic[/yellow]")
+            
+        # Wait for user acknowledgment before returning
+        questionary.press_any_key_to_continue(message="Press any key to return to settings...").ask()
 
 
     def show_help(self) -> None:
@@ -1528,7 +1623,7 @@ This tool leverages powerful AI models for report generation. You can choose a s
 • [i]Requires a correctly configured Claude setup (API key + up-to-date library).[/i]
 • If Claude fails at any point, generation stops.
 
-[bold yellow]Strict Failure:[/bold] With 'OpenAI Only' or 'Claude Only', or if a model fails in 'Balanced' mode, the report generation will halt immediately to ensure adherence to your preference and prevent incomplete reports with mixed/fallback content.
+[bold yellow]Strict Failure:[/bold yellow] With 'OpenAI Only' or 'Claude Only', or if a model fails in 'Balanced' mode, the report generation will halt immediately to ensure adherence to your preference and prevent incomplete reports with mixed/fallback content.
 """
 
         usage_help = """

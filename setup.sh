@@ -44,7 +44,9 @@ source .venv/bin/activate
 echo "Installing Python dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
-
+pip install anthropic
+pip install --upgrade anthropic
+pip install --upgrade openai
 # Build and install the Rust backend
 echo "Building Rust performance backend..."
 cd market_research_cli/market_research_core
