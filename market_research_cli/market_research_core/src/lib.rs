@@ -23,6 +23,8 @@ fn market_research_core(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_report_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(py_list_reports, m)?)?;
     m.add_function(wrap_pyfunction!(clean_escape_sequences, m)?)?;
+    m.add_function(wrap_pyfunction!(export_to_pdf, m)?)?;
+    m.add_function(wrap_pyfunction!(open_file, m)?)?;
     Ok(())
 }
 
@@ -250,7 +252,7 @@ fn process_markdown(content: &str) -> PyResult<(HashMap<String, String>, String)
     for field in required_fields.iter() {
         if !metadata.contains_key(*field) {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Required metadata field '{}' is missing", field)
+                format!("Missing required metadata field: {}", field)
             ));
         }
     }
@@ -261,9 +263,33 @@ fn process_markdown(content: &str) -> PyResult<(HashMap<String, String>, String)
 /// Clean terminal escape sequences from the content
 #[pyfunction]
 fn clean_escape_sequences(content: &str) -> PyResult<String> {
-    // ANSI/VT100 escape sequence regex pattern
-    let escape_seq_pattern = Regex::new(r"\x1B\[([0-9]{1,2}(;[0-9]{1,2})*)?[m|K]").unwrap();
-    let cleaned = escape_seq_pattern.replace_all(content, "").to_string();
+    // Handle various forms of escape sequences
+    
+    // 1. ANSI/VT100 escape sequence regex pattern for real escape codes
+    let ansi_pattern = Regex::new(r"\x1B\[([0-9]{1,2}(;[0-9]{1,2})*)?[m|K|G|A|B|C|D|H|J|s|u|h|l]").unwrap();
+    let mut cleaned = ansi_pattern.replace_all(content, "").to_string();
+    
+    // 2. Literal "ESC[" followed by formatting codes
+    let literal_esc_pattern = Regex::new(r"ESC\[([0-9]{1,2}(;[0-9]{1,2})*)?[m|K|G|A|B|C|D|H|J|s|u|h|l]").unwrap();
+    cleaned = literal_esc_pattern.replace_all(&cleaned, "").to_string();
+    
+    // 3. Simple common patterns
+    let simple_patterns = [
+        Regex::new(r"ESC\[0m").unwrap(),         // Reset
+        Regex::new(r"ESC\[1m").unwrap(),         // Bold
+        Regex::new(r"ESC\[1;33m").unwrap(),      // Yellow bold
+        Regex::new(r"ESC\[\d+m").unwrap(),       // Any single number format
+        Regex::new(r"ESC\[\d+;\d+m").unwrap(),   // Any compound format
+    ];
+    
+    for pattern in simple_patterns.iter() {
+        cleaned = pattern.replace_all(&cleaned, "").to_string();
+    }
+    
+    // 4. Catch-all for other forms
+    let catchall = Regex::new(r"(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]").unwrap();
+    cleaned = catchall.replace_all(&cleaned, "").to_string();
+    
     Ok(cleaned)
 }
 
@@ -314,65 +340,28 @@ fn format_report(markdown: &str) -> PyResult<String> {
     Ok(result)
 }
 
-/// Parse metadata from the YAML frontmatter of a markdown file
+/// Parse report metadata from markdown content
 #[pyfunction]
-fn parse_report_metadata(content: &str) -> PyResult<HashMap<String, String>> {
-    // Validate input is not empty
-    if content.trim().is_empty() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "Content cannot be empty"
-        ));
-    }
-
-    // Expected format: YAML frontmatter between --- delimiters at the start of the file
-    let mut result = HashMap::new();
+fn parse_report_metadata(content: &str) -> PyResult<(HashMap<String, String>, String)> {
+    let re = Regex::new(r"^---\n(.*?)\n---\n(.*)").unwrap();
     
-    // Check if the content starts with a YAML frontmatter section
-    if !content.trim_start().starts_with("---") {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "No YAML frontmatter found - content must start with '---'"
-        ));
-    }
-    
-    // Find the bounds of the YAML section
-    let content_without_initial_whitespace = content.trim_start();
-    let rest = &content_without_initial_whitespace[3..]; // Skip the first ---
-    
-    if let Some(end_idx) = rest.find("---") {
-        let yaml_str = &rest[..end_idx].trim();
-        
-        // Parse the YAML string
-        match serde_yaml::from_str::<HashMap<String, String>>(yaml_str) {
-            Ok(metadata) => {
-                // Validate required fields
-                const REQUIRED_FIELDS: [&str; 2] = ["title", "date"];
-                let missing_fields: Vec<&str> = REQUIRED_FIELDS
-                    .iter()
-                    .filter(|&field| !metadata.contains_key(*field))
-                    .copied()
-                    .collect();
-                
-                if !missing_fields.is_empty() {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Missing required metadata fields: {}", missing_fields.join(", "))
-                    ));
-                }
-                
-                result = metadata;
-            },
-            Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Failed to parse YAML frontmatter: {}", e)
-                ));
-            }
+    match re.captures(content) {
+        Some(caps) => {
+            let yaml_str = caps.get(1).unwrap().as_str();
+            let markdown_content = caps.get(2).unwrap().as_str();
+            
+            let metadata: HashMap<String, String> = serde_yaml::from_str(yaml_str)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Failed to parse YAML metadata: {}", e)
+                ))?;
+            
+            Ok((metadata, markdown_content.to_string()))
+        },
+        None => {
+            // If no metadata section found, return empty metadata and full content
+            Ok((HashMap::new(), content.to_string()))
         }
-    } else {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "Incomplete YAML frontmatter - missing closing '---'"
-        ));
     }
-    
-    Ok(result)
 }
 
 /// Python-exposed function for listing reports
@@ -404,4 +393,190 @@ fn list_reports(dir_path: &str) -> Result<Vec<String>> {
         .collect();
     
     Ok(entries)
+}
+
+/// Convert markdown report to PDF format
+#[pyfunction]
+fn export_to_pdf(content: &str, output_path: &str) -> PyResult<String> {
+    // First, convert markdown to HTML
+    // Clean any terminal escape sequences
+    let cleaned_content = clean_escape_sequences(content)?;
+
+    // Validate input is not empty
+    if cleaned_content.trim().is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Markdown content cannot be empty for PDF conversion"
+        ));
+    }
+    
+    // Create a temporary HTML file
+    let temp_dir = std::env::temp_dir();
+    let temp_html_path = temp_dir.join("report_temp.html");
+    
+    // Create HTML with proper styling for PDF output
+    let mut options = ComrakOptions::default();
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.tagfilter = true;
+    options.extension.autolink = true;
+    options.extension.tasklist = true;
+    options.extension.superscript = true;
+    options.render.github_pre_lang = true;
+    options.render.unsafe_ = true;  // Allow HTML passthrough
+    
+    let html_content = comrak::markdown_to_html(&cleaned_content, &options);
+    
+    // Add CSS styling for PDF output
+    let full_html = format!(r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            font-size: 12pt;
+            line-height: 1.5;
+            margin: 2cm;
+        }}
+        h1, h2, h3, h4, h5, h6 {{
+            color: #333;
+            margin-top: 1.5em;
+            margin-bottom: 0.5em;
+        }}
+        h1 {{ font-size: 24pt; }}
+        h2 {{ font-size: 20pt; }}
+        h3 {{ font-size: 16pt; }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1em 0;
+        }}
+        th, td {{
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }}
+        th {{
+            background-color: #f2f2f2;
+        }}
+        .report-metadata {{
+            margin-bottom: 2em;
+            color: #666;
+            font-style: italic;
+        }}
+        ul, ol {{
+            margin: 0.5em 0;
+            padding-left: 2em;
+        }}
+        code {{
+            font-family: monospace;
+            background-color: #f5f5f5;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }}
+        pre {{
+            background-color: #f5f5f5;
+            padding: 1em;
+            border-radius: 5px;
+            overflow-x: auto;
+        }}
+        blockquote {{
+            background-color: #f9f9f9;
+            border-left: 4px solid #ccc;
+            margin: 1em 0;
+            padding: 0.5em 1em;
+        }}
+    </style>
+</head>
+<body>
+    {html_content}
+</body>
+</html>"#);
+
+    // Write HTML to temp file
+    fs::write(&temp_html_path, full_html)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+            format!("Failed to write temporary HTML file: {}", e)
+        ))?;
+    
+    // Check if wkhtmltopdf is installed and available
+    let wkhtmltopdf_check = std::process::Command::new("wkhtmltopdf")
+        .arg("--version")
+        .output();
+    
+    if let Err(_) = wkhtmltopdf_check {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "wkhtmltopdf not found. Please install wkhtmltopdf to use PDF export functionality."
+        ));
+    }
+    
+    // Convert HTML to PDF using wkhtmltopdf
+    let output = std::process::Command::new("wkhtmltopdf")
+        .arg("--enable-local-file-access")
+        .arg("--page-size")
+        .arg("A4")
+        .arg("--margin-top")
+        .arg("20mm")
+        .arg("--margin-bottom")
+        .arg("20mm")
+        .arg("--margin-left")
+        .arg("20mm")
+        .arg("--margin-right")
+        .arg("20mm")
+        .arg("--encoding")
+        .arg("UTF-8")
+        .arg(temp_html_path.to_string_lossy().to_string())
+        .arg(output_path)
+        .output()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to execute wkhtmltopdf: {}", e)
+        ))?;
+    
+    // Check if wkhtmltopdf succeeded
+    if !output.status.success() {
+        let error_output = String::from_utf8_lossy(&output.stderr);
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("wkhtmltopdf failed: {}", error_output)
+        ));
+    }
+    
+    // Check if PDF was created
+    if !Path::new(output_path).exists() {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "PDF file was not created successfully"
+        ));
+    }
+    
+    Ok(output_path.to_string())
+}
+
+/// Open a file with the default system application
+#[pyfunction]
+fn open_file(file_path: &str) -> PyResult<bool> {
+    // Determine which command to use based on platform
+    let command = if cfg!(target_os = "windows") {
+        ("cmd", ["/c", "start", "", file_path].to_vec())
+    } else if cfg!(target_os = "macos") {
+        ("open", [file_path].to_vec())
+    } else {
+        ("xdg-open", [file_path].to_vec())  // Linux/Unix
+    };
+    
+    // Execute the command
+    let output = std::process::Command::new(command.0)
+        .args(command.1)
+        .output()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to open file: {}", e)
+        ))?;
+    
+    // Check if command succeeded
+    if !output.status.success() {
+        let error_output = String::from_utf8_lossy(&output.stderr);
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("Failed to open file: {}", error_output)
+        ));
+    }
+    
+    Ok(true)
 }

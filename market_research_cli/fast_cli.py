@@ -5,9 +5,14 @@ import time
 import random
 import threading
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from pathlib import Path
 import re
+import subprocess
+import tempfile
+import shutil
+import platform
+import sys
 
 # Load environment variables first
 from dotenv import load_dotenv
@@ -24,6 +29,7 @@ from rich.markdown import Markdown
 from rich.live import Live
 from rich.layout import Layout
 from rich.text import Text
+from rich.align import Align
 import typer
 
 # OpenAI API
@@ -45,11 +51,19 @@ try:
         format_report,
         parse_report_metadata,
         clean_escape_sequences,
-        RUST_CORE_AVAILABLE
+        RUST_CORE_AVAILABLE,
+        export_to_pdf,
+        open_file
     )
     is_rust_enabled = RUST_CORE_AVAILABLE
 except ImportError:
     is_rust_enabled = False
+    # Import the Python fallback for export_to_pdf
+    try:
+        from market_research_core_py.market_research_core_py import export_to_pdf, export_to_pdf_python, open_file, clean_escape_sequences
+    except ImportError:
+        # If we can't import directly, we'll define them below
+        pass
 
 # Import Twilio if available
 try:
@@ -101,7 +115,33 @@ if CLAUDE_API_KEY:
         # Check if we can initialize the client
         try:
             # Modern client initialization
-            claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+            try:
+                # Try to handle different versions of anthropic library
+                import pkg_resources
+                anthropic_version = pkg_resources.get_distribution("anthropic").version
+                console.print(f"[cyan]Detected anthropic library version: {anthropic_version}[/cyan]")
+                
+                # Initialize client
+                try:
+                    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+                except TypeError as e:
+                    if "proxies" in str(e):
+                        # If error mentions proxies, import with older signature
+                        console.print("[yellow]Detected proxies parameter issue, using compatible initialization...[/yellow]")
+                        # Create client with only required parameters - find exactly what parameters are accepted
+                        import inspect
+                        init_params = inspect.signature(anthropic.Anthropic.__init__).parameters
+                        if len(init_params) > 2:  # self and api_key are always present
+                            console.print(f"[yellow]Found {len(init_params)-2} additional parameters in constructor[/yellow]")
+                        # Always use the simplest form that should work across versions
+                        claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+                    else:
+                        raise  # Re-raise if it's a different TypeError
+            except (pkg_resources.DistributionNotFound, ImportError, Exception) as e:
+                # If we can't check version, try direct initialization
+                console.print(f"[yellow]Couldn't determine anthropic version: {str(e)}. Trying direct initialization...[/yellow]")
+                claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+                        
             CLAUDE_AVAILABLE = True
 
             # Check if Messages API is available (primary method)
@@ -146,8 +186,16 @@ else:
             except Exception as e:
                 print(f"Warning: Could not use clean_escape_sequences: {e}. Using direct regex.")
                 try:
-                    # More comprehensive ANSI/VT100 escape sequence pattern
-                    # This captures both actual escape characters and text representations like "ESC["
+                    # Handle text representations of ESC
+                    import re
+                    esc_pattern = re.compile(r'ESC\[(\d+;)*\d*[a-zA-Z]|ESC\[\d+m|ESC\[0m|ESC\[1m|ESC\[4m|ESC\[\d+;\d+m')
+                    content = esc_pattern.sub('', content)
+                    
+                    # Handle actual ANSI escape sequences
+                    ansi_pattern = re.compile(r'\x1B\[(\d+;)*\d*[a-zA-Z]|\x1B\[\d+m|\x1B\[0m|\x1B\[1m|\x1B\[4m|\x1B\[\d+;\d+m')
+                    content = ansi_pattern.sub('', content)
+                    
+                    # Comprehensive pattern as final cleanup
                     escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
                     content = escape_seq_pattern.sub('', content)
                 except Exception as inner_e:
@@ -194,17 +242,268 @@ Generated on: {timestamp}
             # Try to use the Python wrapper function first
             content = clean_escape_sequences(content)
         except Exception as e:
-            print(f"Warning: Could not use clean_escape_sequences in format_report: {e}. Using direct regex.")
-            # Use regex directly for cleaning
-            try:
-                # More comprehensive ANSI/VT100 escape sequence pattern
-                # This captures both actual escape characters and text representations like "ESC["
-                escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
-                content = escape_seq_pattern.sub('', content)
-            except Exception as inner_e:
-                print(f"Warning: Could not clean escape sequences in format_report: {inner_e}")
+            # Fallback if function not available
+            escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+            content = escape_seq_pattern.sub('', content)
             
         return header + content
+
+    # Fallback for PDF export if not imported
+    if 'export_to_pdf' not in globals():
+        # Check if ReportLab is available
+        REPORTLAB_AVAILABLE = False
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+            from reportlab.lib.units import inch, cm
+            REPORTLAB_AVAILABLE = True
+        except ImportError:
+            REPORTLAB_AVAILABLE = False
+        
+        def export_to_pdf(content, output_path):
+            """Python fallback for PDF export if the imported version is not available"""
+            # Clean any escape sequences
+            escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+            cleaned_content = escape_seq_pattern.sub('', content)
+            
+            # Check if wkhtmltopdf is available
+            wkhtmltopdf_available = False
+            try:
+                subprocess.run(['wkhtmltopdf', '--version'], 
+                              check=True, 
+                              stdout=subprocess.PIPE, 
+                              stderr=subprocess.PIPE)
+                wkhtmltopdf_available = True
+            except (subprocess.SubprocessError, FileNotFoundError):
+                wkhtmltopdf_available = False
+            
+            # If wkhtmltopdf is available, use it (better quality)
+            if wkhtmltopdf_available:
+                # Create temp HTML file
+                with tempfile.NamedTemporaryFile(suffix='.html', delete=False, mode='w', encoding='utf-8') as f:
+                    temp_html_path = f.name
+                    
+                    # Convert markdown to HTML
+                    try:
+                        import markdown
+                        html_content = markdown.markdown(
+                            cleaned_content, 
+                            extensions=['tables', 'fenced_code']
+                        )
+                    except ImportError:
+                        # Basic fallback if markdown module not available
+                        html_content = cleaned_content.replace('\n', '<br>')
+                        html_content = f"<pre>{html_content}</pre>"
+                    
+                    # Add CSS styling
+                    full_html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            line-height: 1.5;
+            margin: 2cm;
+        }}
+        h1, h2, h3, h4, h5, h6 {{
+            color: #333;
+        }}
+    </style>
+</head>
+<body>
+    {html_content}
+</body>
+</html>"""
+                    f.write(full_html)
+                
+                # Convert HTML to PDF
+                try:
+                    subprocess.run([
+                        'wkhtmltopdf',
+                        '--enable-local-file-access',
+                        temp_html_path,
+                        output_path
+                    ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                except subprocess.SubprocessError as e:
+                    raise RuntimeError(f"Failed to convert to PDF: {e}")
+                finally:
+                    # Clean up temp file
+                    try:
+                        os.unlink(temp_html_path)
+                    except:
+                        pass
+            
+            # If wkhtmltopdf not available but reportlab is, use it
+            elif REPORTLAB_AVAILABLE:
+                print("Using ReportLab for PDF generation (wkhtmltopdf not found)")
+                
+                # Extract metadata and title
+                metadata = {}
+                title = "Market Research Report"
+                
+                # Try to extract YAML front matter if present
+                if cleaned_content.startswith('---'):
+                    end_marker = cleaned_content.find('---', 3)
+                    if end_marker != -1:
+                        yaml_part = cleaned_content[3:end_marker].strip()
+                        try:
+                            import yaml
+                            metadata = yaml.safe_load(yaml_part)
+                            cleaned_content = cleaned_content[end_marker+3:].strip()
+                        except:
+                            pass
+                
+                # Try to find title from metadata or first heading
+                if metadata and 'title' in metadata:
+                    title = metadata['title']
+                else:
+                    import re
+                    title_match = re.search(r"^#\s+(.*?)$", cleaned_content, re.MULTILINE)
+                    if title_match:
+                        title = title_match.group(1).strip()
+                
+                # Initialize PDF document
+                doc = SimpleDocTemplate(
+                    output_path,
+                    pagesize=A4,
+                    leftMargin=2*cm,
+                    rightMargin=2*cm,
+                    topMargin=2*cm,
+                    bottomMargin=2*cm
+                )
+                
+                # Get styles
+                styles = getSampleStyleSheet()
+                styles.add(ParagraphStyle(
+                    name='Heading1',
+                    parent=styles['Heading1'],
+                    fontSize=24,
+                    spaceAfter=20
+                ))
+                styles.add(ParagraphStyle(
+                    name='Heading2',
+                    parent=styles['Heading2'],
+                    fontSize=18,
+                    spaceAfter=15,
+                    spaceBefore=20
+                ))
+                styles.add(ParagraphStyle(
+                    name='Heading3',
+                    parent=styles['Heading3'],
+                    fontSize=14,
+                    spaceAfter=10,
+                    spaceBefore=15
+                ))
+                styles.add(ParagraphStyle(
+                    name='Normal',
+                    parent=styles['Normal'],
+                    fontSize=11,
+                    spaceAfter=8
+                ))
+                
+                # Create elements for the document
+                elements = []
+                
+                # Add title
+                elements.append(Paragraph(title, styles['Heading1']))
+                
+                # Add metadata if available
+                if metadata:
+                    date = metadata.get('date', datetime.now().strftime("%B %d, %Y"))
+                    report_id = metadata.get('id', 'N/A')
+                    
+                    meta_text = f"Generated on: {date}<br/>Report ID: {report_id}<br/>Confidential Document"
+                    elements.append(Paragraph(meta_text, styles['Italic']))
+                    elements.append(Spacer(1, 0.5*inch))
+                
+                # Simple processing of markdown content
+                # Split by headings
+                content_parts = re.split(r'(^#{1,6}\s+.*$)', cleaned_content, flags=re.MULTILINE)
+                
+                current_text = ""
+                for part in content_parts:
+                    if part.strip():
+                        if re.match(r'^#{1,6}\s+', part):
+                            # If we have accumulated text, add it as a paragraph
+                            if current_text:
+                                elements.append(Paragraph(current_text, styles['Normal']))
+                                current_text = ""
+                                
+                            # Process heading
+                            level = len(re.match(r'^(#+)', part).group(1))
+                            heading_text = part[level:].strip()
+                            
+                            if level == 1:
+                                elements.append(Paragraph(heading_text, styles['Heading1']))
+                            elif level == 2:
+                                elements.append(Paragraph(heading_text, styles['Heading2']))
+                            else:
+                                elements.append(Paragraph(heading_text, styles['Heading3']))
+                        else:
+                            # Accumulate text
+                            current_text += part
+                
+                # Add any remaining text
+                if current_text:
+                    elements.append(Paragraph(current_text, styles['Normal']))
+                
+                # Build the PDF
+                doc.build(elements)
+            else:
+                # Neither wkhtmltopdf nor reportlab is available
+                raise RuntimeError(
+                    "Unable to generate PDF: wkhtmltopdf not found and reportlab is not installed.\n\n"
+                    "Please install one of the following:\n"
+                    "1. wkhtmltopdf (recommended):\n"
+                    "   - macOS: brew install wkhtmltopdf\n"
+                    "   - Ubuntu/Debian: sudo apt-get install wkhtmltopdf\n"
+                    "   - Windows: Download from https://wkhtmltopdf.org/downloads.html\n\n"
+                    "2. ReportLab (alternative):\n"
+                    "   - pip install reportlab\n"
+                )
+            
+            # Check if PDF was created
+            if not os.path.exists(output_path):
+                raise RuntimeError("PDF file was not created successfully")
+                
+            return output_path
+    
+    # Fallback for opening files if not imported
+    if 'open_file' not in globals():
+        def open_file(file_path):
+            """Python implementation to open a file with the default system application"""
+            import platform
+            try:
+                if platform.system() == 'Windows':
+                    os.startfile(file_path)
+                elif platform.system() == 'Darwin':  # macOS
+                    subprocess.run(['open', file_path], check=True)
+                else:  # Linux/Unix
+                    subprocess.run(['xdg-open', file_path], check=True)
+                return True
+            except Exception as e:
+                raise RuntimeError(f"Failed to open file: {e}")
+    
+    # Fallback for cleaning escape sequences if not imported
+    if 'clean_escape_sequences' not in globals():
+        def clean_escape_sequences(content):
+            """Enhanced Python fallback for cleaning ANSI escape sequences"""
+            # First, handle text representations of ESC
+            esc_pattern = re.compile(r'ESC\[(\d+;)*\d*[a-zA-Z]|ESC\[\d+m|ESC\[0m|ESC\[1m|ESC\[4m|ESC\[\d+;\d+m')
+            content = esc_pattern.sub('', content)
+            
+            # Then handle actual ANSI escape sequences
+            ansi_pattern = re.compile(r'\x1B\[(\d+;)*\d*[a-zA-Z]|\x1B\[\d+m|\x1B\[0m|\x1B\[1m|\x1B\[4m|\x1B\[\d+;\d+m')
+            content = ansi_pattern.sub('', content)
+            
+            # More comprehensive pattern for any remaining escapes
+            full_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
+            content = full_pattern.sub('', content)
+            
+            return content
 
     def parse_report_metadata(content):
          """Basic Python implementation for parsing metadata."""
@@ -437,18 +736,43 @@ def convert_stage_to_title(stage: str) -> str:
 
 
 def display_ascii_title():
-    """Display an ASCII art title."""
-    title = r"""
-__  __            _        _     ___                               _
-|  \/  | __ _ _ __| | _____| |   |_ _|_ __ ___  _ __ ___   ___ _ __ | |_ ___
-| |\/| |/ _` | '__| |/ / _ \ __|   | || '_ ` _ \| '_ ` _ \ / _ \ '_ \| __/ _ \
-| |  | | (_| | |  |   <  __/ |     | || | | | | | | | | | |  __/ | | | || (_) |
-|_|  |_|\__,_|_|  |_|\_\___|\__|___|___|_| |_| |_|_| |_| |_|\___|_| |_|\__\___/
-
-""" + "\n" + "=" * 80
-    console.print(f"[bold blue]{title}[/bold blue]")
-    acceleration_status = "[bold green]ACCELERATED BY RUST[/bold green]" if is_rust_enabled else "[yellow]Standard Python Mode[/yellow]"
-    console.print(f"\n{acceleration_status}\n")
+    """Display a clean, simple title that renders reliably in CLI environments."""
+    
+    # Create a larger, centered title with no box outline
+    title = Text("""
+  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+  ┃                                                         ┃
+  ┃                 170 AI MARKET AGENT                     ┃
+  ┃                                                         ┃
+  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+    """)
+    
+    # Apply gradient coloring to the title
+    title.stylize("bold")
+    for i in range(len(title)):
+        if title.plain[i] not in [' ', '\n']:
+            hue = (i % 360) / 360.0  # Create a rainbow effect
+            title.stylize(f"rgb({int(255*(1-hue))},{int(255*hue)},{int(255*(0.5-abs(0.5-hue)*2))}", i, i+1)
+    
+    # Create subtitle with emoji and styling
+    subtitle = Text("\n⚡️ Powered by Advanced AI & Rust ⚡️", style="bold cyan")
+    
+    # Create status indicator
+    if is_rust_enabled:
+        status = Text("\n🚀 ACCELERATED BY RUST", style="bold green")
+    else:
+        status = Text("\n⚠️ Standard Python Mode", style="bold yellow")
+    
+    # Combine all elements with better spacing
+    full_title = Text.assemble(
+        title,
+        subtitle,
+        "\n",
+        status
+    )
+    
+    # Display the combined title without a panel
+    console.print(Align.center(full_title))
 
 
 # --- Core Report Generation Orchestrator (Modified for Strict Error Handling) ---
@@ -611,8 +935,17 @@ def generate_market_research_report(topic: str, progress_callback=None, model_pr
         # --- Report Generation Loop ---
         report_sections = []
         # Create the header using format_report (Rust or Python version)
-        report_header = format_report("", topic.title()) # Pass empty content for header generation
-        report_sections.append(report_header)
+        try:
+            # The format_report function is already imported at the top level
+            # and handles both Python and Rust implementations
+            console.print(f"[cyan]Generating report header for {topic.title()}...[/cyan]")
+            report_header = format_report("", topic.title())
+            report_sections.append(report_header)
+        except Exception as e:
+            console.print(f"[bold red]Error generating report header: {str(e)}[/bold red]")
+            console.print_exception(show_locals=False)
+            console.print("[bold yellow]Aborting report generation.[/bold yellow]")
+            return None
 
         for i, stage in enumerate(stages):
             stage_name = stage["name"]
@@ -789,34 +1122,72 @@ class FastCLI:
 
     def main_menu(self) -> None:
         """Display the main menu and handle user input."""
+        # Add a flag to try simple input if questionary fails
+        use_simple_input = False
+        
         while True:
-            choice = questionary.select(
-                "What would you like to do?",
-                choices=[
-                    "Generate a new market research report",
-                    "View existing reports",
-                    "Delete a report",
-                    "Configure settings",
-                    "Help & AI model information",
-                    "Exit"
-                ],
-                qmark=">" # Custom marker
-            ).ask()
-
-            if choice is None: # Handle Ctrl+C
-                 choice = "Exit"
-
-            if choice == "Generate a new market research report":
+            console.print("\n[bold cyan]------------------------------[/bold cyan]")
+            choices = [
+                "Generate a new market research report",
+                "View existing reports",
+                "Export a report to PDF",
+                "Delete a report",
+                "Configure settings",
+                "Help & AI model information",
+                "Exit"
+            ]
+            
+            choice = None
+            # Try questionary first unless we've already determined it doesn't work
+            if not use_simple_input:
+                try:
+                    choice = questionary.select(
+                        "What would you like to do?",
+                        choices=choices,
+                        qmark=">", # Custom marker
+                        use_indicator=True,
+                        use_shortcuts=True,
+                        use_arrow_keys=True
+                    ).ask()
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Interactive selection failed: {str(e)}[/yellow]")
+                    console.print("[yellow]Switching to simple input mode...[/yellow]")
+                    use_simple_input = True
+            
+            # If questionary failed or we're in simple input mode, use basic input
+            if choice is None or use_simple_input:
+                # Show choices as a simple list for visibility
+                for i, choice in enumerate(choices, 1):
+                    console.print(f"  {i}. {choice}")
+                console.print("Enter the number of your choice (1-7): ", end="")
+                try:
+                    user_input = input().strip()
+                    if user_input.isdigit() and 1 <= int(user_input) <= 7:
+                        idx = int(user_input) - 1
+                        choice = choices[idx]
+                    else:
+                        console.print("[red]Invalid input. Please enter a number between 1 and 7.[/red]")
+                        continue
+                except EOFError:
+                    console.print("[red]Input error. Exiting...[/red]")
+                    return
+                except Exception as e:
+                    console.print(f"[red]Error reading input: {str(e)}. Exiting...[/red]")
+                    return
+            
+            if choice == "Generate a new market research report" or choice == "1":
                 self.generate_report()
-            elif choice == "View existing reports":
-                self.list_reports() # Changed to list first, then optionally view
-            elif choice == "Delete a report":
+            elif choice == "View existing reports" or choice == "2":
+                self.list_reports()
+            elif choice == "Export a report to PDF" or choice == "3":
+                self.export_reports()
+            elif choice == "Delete a report" or choice == "4":
                 self.delete_report()
-            elif choice == "Configure settings":
+            elif choice == "Configure settings" or choice == "5":
                 self.settings()
-            elif choice == "Help & AI model information":
+            elif choice == "Help & AI model information" or choice == "6":
                 self.show_help()
-            elif choice == "Exit":
+            elif choice == "Exit" or choice == "7":
                 console.print("\n[bold green]Exiting Market Research Generator. Goodbye![/bold green]")
                 return # Exit the loop and the program
 
@@ -1204,61 +1575,82 @@ class FastCLI:
 
 
     def list_reports(self) -> None:
-        """List available reports and offer viewing."""
-        try:
-            reports = report_manager.get_all_reports()
-        except Exception as e:
-             console.print(f"[red]Error listing reports: {e}[/red]")
-             return
-
+        """List all available reports."""
+        reports = report_manager.get_all_reports()
+        
         if not reports:
-            console.print("[yellow]No reports found in the 'reports' directory.[/yellow]")
+            console.print("\n[bold yellow]No reports found.[/bold yellow]")
+            console.print("Generate a new report to get started.\n")
             return
-
-        console.print("\n[bold underline]Available Market Research Reports:[/bold underline]\n")
-        table = Table(show_header=True, header_style="bold magenta", border_style="dim")
-        table.add_column("#", style="dim", width=3)
-        table.add_column("Report Title", style="cyan", min_width=20)
-        table.add_column("Date Generated", style="green", width=20)
-        table.add_column("File Name", style="blue", no_wrap=True)
-
+        
+        console.print("\n[bold blue]Available Market Research Reports:[/bold blue]\n")
+        
         report_details = []
+        
+        # Process each report to extract metadata
         for i, report_filename in enumerate(reports, 1):
             try:
-                content = report_manager.read_report(report_filename)
-                # Use Rust/Python parse_report_metadata
-                metadata = parse_report_metadata(content)
-                title = metadata.get("title", "Unknown Title").replace(" Market Analysis", "")
+                report_path = REPORTS_DIR / report_filename
+                content = report_path.read_text(encoding='utf-8')
+                
+                # Parse metadata with compatibility handling
+                metadata_result = parse_report_metadata(content)
+                
+                # Handle both return types: Dict from Python implementation or (Dict, String) tuple from Rust
+                if isinstance(metadata_result, tuple) and len(metadata_result) == 2:
+                    # Rust implementation returns (metadata_dict, content_str)
+                    metadata = metadata_result[0]
+                else:
+                    # Python implementation returns just the metadata dict
+                    metadata = metadata_result
+                
+                title = metadata.get("title", report_filename)
                 date = metadata.get("date", "Unknown Date")
-                report_details.append({"index": i, "title": title, "date": date, "filename": report_filename})
-                table.add_row(str(i), title, date, report_filename)
+                report_id = metadata.get("id", "N/A")
+                
+                report_details.append({
+                    "index": i, 
+                    "title": title, 
+                    "date": date, 
+                    "id": report_id,
+                    "filename": report_filename
+                })
+                
+                # Print report information
+                console.print(f"[bold cyan]{i}.[/bold cyan] [green]{title}[/green]")
+                console.print(f"   [dim]Generated:[/dim] [blue]{date}[/blue]")
+                console.print(f"   [dim]ID:[/dim] [yellow]{report_id}[/yellow]")
+                console.print(f"   [dim]File:[/dim] {report_filename}")
+                console.print()
+                
             except Exception as e:
                 console.print(f"[yellow]Could not parse metadata for {report_filename}: {e}[/yellow]")
-                # Add row with defaults if parsing fails
-                report_details.append({"index": i, "title": report_filename, "date": "N/A", "filename": report_filename})
-                table.add_row(str(i), report_filename, "N/A", report_filename)
-
-
-        console.print(table)
-
-        # Ask if the user wants to view a report
-        if questionary.confirm("View a report by entering its # number?", default=True).ask():
-            report_num_str = questionary.text(
-                 "Enter report number to view (or press Enter to cancel):",
-                 validate=lambda text: text.isdigit() and 1 <= int(text) <= len(reports) or text == ""
-                 ).ask()
-
-            if report_num_str:
-                 try:
-                      report_index = int(report_num_str) - 1
-                      selected_report_filename = report_details[report_index]["filename"]
-                      report_path = Path(REPORTS_DIR) / selected_report_filename
-                      view_report(report_path, console) # Call standalone view function
-                 except (ValueError, IndexError):
-                      console.print("[red]Invalid report number.[/red]")
-            else:
-                 console.print("View cancelled.")
-
+                # Add with defaults if parsing fails
+                report_details.append({
+                    "index": i, 
+                    "title": report_filename, 
+                    "date": "N/A", 
+                    "id": "N/A",
+                    "filename": report_filename
+                })
+                
+                # Print minimal information
+                console.print(f"[bold cyan]{i}.[/bold cyan] {report_filename}")
+                console.print(f"   [dim]Error parsing metadata[/dim]")
+                console.print()
+        
+        # Store report details for other methods to use
+        self.report_details = report_details
+        
+        # Show options
+        if reports:
+            choice = questionary.text(
+                "Enter the number of the report to view (or press Enter to go back):",
+                validate=lambda text: text == "" or text.isdigit() and 1 <= int(text) <= len(reports)
+            ).ask()
+            
+            if choice:
+                self.view_report_by_index(int(choice))
 
     def view_report_by_index(self, index: int) -> None: # Kept for potential direct calling
         """View a specific report by its index from the last listing."""
@@ -1275,7 +1667,134 @@ class FastCLI:
                  console.print("[red]Invalid report index.[/red]")
         except Exception as e:
              console.print(f"[red]Error viewing report: {e}[/red]")
+             
+    def export_reports(self) -> None:
+        """Export reports to PDF."""
+        try:
+            reports = report_manager.get_all_reports()
+        except Exception as e:
+            console.print(f"[red]Error listing reports for export: {e}[/red]")
+            return
 
+        if not reports:
+            console.print("[yellow]No reports found to export.[/yellow]")
+            return
+        
+        # Check if PDF export is available - use try/except to detect reportlab
+        reportlab_available = False
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+            from reportlab.lib.units import inch, cm
+            reportlab_available = True
+            console.print("[green]ReportLab is available for PDF export.[/green]")
+        except ImportError:
+            console.print("[yellow]ReportLab library not found. PDF export will attempt to use alternatives.[/yellow]")
+            reportlab_available = False
+        
+        # Create a list of report options with index and title/date
+        report_options = []
+        for i, report_filename in enumerate(reports):
+            try:
+                content = report_manager.read_report(report_filename)
+                
+                # Clean escape sequences from content
+                try:
+                    content = clean_escape_sequences(content)
+                except Exception:
+                    # Continue without cleaning if it fails
+                    pass
+                
+                # Handle potential tuple return from parse_report_metadata
+                metadata_result = parse_report_metadata(content)
+                if isinstance(metadata_result, tuple) and len(metadata_result) == 2:
+                    # Rust implementation returns (metadata_dict, content_str)
+                    metadata = metadata_result[0]
+                else:
+                    # Python implementation returns just the metadata dict
+                    metadata = metadata_result
+                    
+                title = metadata.get("title", report_filename).replace(" Market Analysis", "")
+                date = metadata.get("date", "Unknown Date")
+                report_options.append(f"#{i+1}: {title} ({date}) - [{report_filename}]")
+            except Exception as e:
+                # On any error, add basic filename entry
+                report_options.append(f"#{i+1}: {report_filename} (Error: {str(e)[:30]}...)")
+
+        report_options.append("Cancel")
+
+        choice = questionary.select(
+            "Select a report to export to PDF:",
+            choices=report_options
+        ).ask()
+
+        if choice is None or choice == "Cancel":
+            console.print("Export cancelled.")
+            return
+            
+        # Extract index from selection
+        try:
+            # Parse the index from the choice string (#X: ...)
+            selection_idx = int(choice.split('#')[1].split(':')[0]) - 1
+            report_filename = reports[selection_idx]
+            report_path = Path(REPORTS_DIR) / report_filename
+            self.export_single_report(report_path)
+        except Exception as e:
+            console.print(f"[red]Error exporting report: {e}[/red]")
+    
+    def export_single_report(self, report_path: Path) -> None:
+        """Export a single report to PDF."""
+        # Check if PDF export is available
+        reportlab_available = False
+        try:
+            from reportlab.lib.pagesizes import A4
+            reportlab_available = True
+        except ImportError:
+            reportlab_available = False
+            
+        try:
+            # Read the report content
+            content = report_path.read_text(encoding='utf-8')
+            
+            # Clean escape sequences from content
+            try:
+                content = clean_escape_sequences(content)
+            except Exception as e:
+                console.print(f"[yellow]Warning: Error cleaning escape sequences: {e}[/yellow]")
+                
+            # Default output path is in the same directory with .pdf extension
+            output_path = report_path.with_suffix('.pdf')
+            
+            # Allow user to specify a different output path
+            custom_path = questionary.text(
+                "Enter output path for PDF (or press Enter for default):",
+            ).ask()
+            
+            if custom_path:
+                output_path = Path(custom_path)
+                # Ensure the file has .pdf extension
+                if output_path.suffix.lower() != '.pdf':
+                    output_path = output_path.with_suffix('.pdf')
+            
+            # Export to PDF
+            console.print(f"[yellow]Exporting to PDF: {output_path}[/yellow]")
+            export_to_pdf(content, str(output_path))
+            console.print(f"[green]✓ Report exported to: {output_path}[/green]")
+            
+            # Ask if user wants to open the PDF
+            if questionary.confirm("Open the PDF file?").ask():
+                try:
+                    open_file(output_path)
+                    console.print("[green]✓ Opening PDF viewer[/green]")
+                except Exception as e:
+                    console.print(f"[yellow]Could not open PDF automatically: {e}[/yellow]")
+                    console.print(f"Please open manually: {output_path}")
+                    
+        except Exception as e:
+            console.print(f"[red]Error exporting report to PDF: {e}[/red]")
+            console.print(f"Details: {str(e)}")
 
     def delete_report(self) -> None:
         """Allows the user to select and delete a report."""
@@ -1294,12 +1813,29 @@ class FastCLI:
         for i, report_filename in enumerate(reports):
             try:
                 content = report_manager.read_report(report_filename)
-                metadata = parse_report_metadata(content)
+                
+                # Clean escape sequences from content
+                try:
+                    content = clean_escape_sequences(content)
+                except Exception:
+                    # Continue without cleaning if it fails
+                    pass
+                
+                # Handle potential tuple return from parse_report_metadata
+                metadata_result = parse_report_metadata(content)
+                if isinstance(metadata_result, tuple) and len(metadata_result) == 2:
+                    # Rust implementation returns (metadata_dict, content_str)
+                    metadata = metadata_result[0]
+                else:
+                    # Python implementation returns just the metadata dict
+                    metadata = metadata_result
+                    
                 title = metadata.get("title", report_filename).replace(" Market Analysis", "")
                 date = metadata.get("date", "Unknown Date")
                 report_options.append(f"#{i+1}: {title} ({date}) - [{report_filename}]")
-            except Exception:
-                 report_options.append(f"#{i+1}: {report_filename}")
+            except Exception as e:
+                # On any error, add basic filename entry
+                report_options.append(f"#{i+1}: {report_filename} (Error: {str(e)[:30]}...)")
 
         report_options.append("Cancel")
 
@@ -1311,390 +1847,131 @@ class FastCLI:
         if choice is None or choice == "Cancel":
             console.print("Deletion cancelled.")
             return
-
-        try:
-            # Extract index from choice string (e.g., "#1: ...")
-            report_index = int(choice.split(":")[0][1:]) - 1
-            if 0 <= report_index < len(reports):
-                 report_filename_to_delete = reports[report_index]
-                 display_name = choice.split(" - [")[0] # Get the display part for confirm message
-
-                 if questionary.confirm(f"Are you sure you want to delete '{display_name}'?").ask():
-                      success = report_manager.delete_report(report_filename_to_delete)
-                      if success:
-                           console.print(f"[bold green]Report '{report_filename_to_delete}' deleted successfully.[/bold green]")
-                      else:
-                           # Should not happen if file existed unless permissions issue
-                           console.print(f"[bold red]Failed to delete report '{report_filename_to_delete}'. File might already be gone or permissions denied.[/bold red]")
-            else:
-                 console.print("[red]Invalid selection index.[/red]")
-
-        except (ValueError, IndexError):
-             console.print("[red]Could not parse selection. Deletion failed.[/red]")
-        except Exception as e:
-             console.print(f"[red]An error occurred during deletion: {e}[/red]")
-
-
-    def settings(self) -> None:
-        """Configure application settings."""
-        global CLAUDE_AVAILABLE, CLAUDE_API_KEY, CLAUDE_MESSAGES_API_AVAILABLE, claude_client
-        global TWILIO_AVAILABLE, TWILIO_ENABLED, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
-        
-        while True:
-            options = []
-            # OpenAI
-            openai_key = os.getenv("OPENAI_API_KEY")
-            openai_status = "[green]Set[/green]" if openai_key else "[yellow]Not Set[/yellow]"
-            options.append(f"OpenAI API Key ({openai_status})")
-
-            # Claude
-            claude_key = os.getenv("ANTHROPIC_API_KEY")
-            claude_lib_status = "[green]Installed[/green]" if CLAUDE_AVAILABLE else "[red]Not Installed[/red]"
-            claude_key_status = "[green]Set[/green]" if claude_key else "[yellow]Not Set[/yellow]"
-            options.append(f"Claude API Key ({claude_key_status}, Lib: {claude_lib_status})")
             
-            # Add dedicated option for installing Anthropic library
-            anthropic_install_option = "Install Anthropic Library" if not CLAUDE_AVAILABLE else "Update Anthropic Library"
-            options.append(f"{anthropic_install_option} (Current: {claude_lib_status})")
-
-            # Brave Search
-            brave_key = os.getenv("BRAVE_API_KEY")
-            brave_status = "[green]Set[/green]" if brave_key else "[yellow]Not Set[/yellow]"
-            brave_lib_status = "[green]Available[/green]" if WEB_SEARCH_AVAILABLE else "[red]Not Available[/red]"
-            options.append(f"Brave Search API Key ({brave_status}, Module: {brave_lib_status})")
-
-            # Twilio SMS
-            twilio_lib_status = "[green]Installed[/green]" if TWILIO_AVAILABLE else "[red]Not Installed[/red]"
-            twilio_configured = "[green]Configured[/green]" if TWILIO_ENABLED else "[yellow]Not Configured[/yellow]"
-            options.append(f"SMS Configuration (Twilio: {twilio_lib_status}, {twilio_configured})")
-
-            options.append("Back to Main Menu")
-
-            choice = questionary.select(
-                "Configure Settings:",
-                choices=options
-            ).ask()
-
-            if choice is None or choice == "Back to Main Menu":
-                return
-
-            # --- Handle Setting Updates ---
-            if choice.startswith("OpenAI API Key"):
-                self._update_api_key("OPENAI_API_KEY", "OpenAI")
-                global OPENAI_API_KEY
-                OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Refresh global var
-
-            elif choice.startswith("Claude API Key"):
-                if not CLAUDE_AVAILABLE:
-                     if questionary.confirm("Claude library ('anthropic') not installed. Install now?", default=True).ask():
-                          self._install_anthropic_package()
-                          # Re-check availability after install attempt
-                          try:
-                               import anthropic
-                        
-                               CLAUDE_AVAILABLE = True
-                          except ImportError: pass # Stay unavailable if install fails
-                     else:
-                          console.print("[yellow]Skipping Claude configuration as library is missing.[/yellow]")
-                          continue # Go back to settings menu
-
-                # Proceed with key update if library is available
-                self._update_api_key("ANTHROPIC_API_KEY", "Claude")
-                global CLAUDE_API_KEY, claude_client, CLAUDE_MESSAGES_API_AVAILABLE
-                CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-                # Re-initialize client if key was set/changed
-                if CLAUDE_API_KEY and CLAUDE_AVAILABLE:
-                     try:
-                          claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-                          CLAUDE_MESSAGES_API_AVAILABLE = hasattr(claude_client, "messages") and callable(getattr(claude_client.messages, "create", None))
-                          console.print("[green]Claude client re-initialized.[/green]")
-                     except Exception as e:
-                          console.print(f"[red]Failed to re-initialize Claude client: {e}[/red]")
-                          claude_client = None
-                          CLAUDE_MESSAGES_API_AVAILABLE = False
+        # Add the missing implementation for deleting a report
+        try:
+            # Parse the index from the choice string (#X: ...)
+            selection_idx = int(choice.split('#')[1].split(':')[0]) - 1
+            report_filename = reports[selection_idx]
+            
+            # Confirm deletion
+            if questionary.confirm(f"Are you sure you want to delete '{report_filename}'?", default=False).ask():
+                if report_manager.delete_report(report_filename):
+                    console.print(f"[green]Report '{report_filename}' deleted successfully.[/green]")
                 else:
-                     claude_client = None # Clear client if key removed or lib unavailable
-                     CLAUDE_MESSAGES_API_AVAILABLE = False
-
-            elif choice.startswith("Install Anthropic Library") or choice.startswith("Update Anthropic Library"):
-                # Direct option to install/update the Anthropic library
-                self._install_anthropic_package()
-                # After installation, check if we need to initialize the client
-                if CLAUDE_AVAILABLE and CLAUDE_API_KEY and not claude_client:
-                    try:
-                        import anthropic
-                        claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-                        CLAUDE_MESSAGES_API_AVAILABLE = hasattr(claude_client, "messages") and callable(getattr(claude_client.messages, "create", None))
-                        console.print("[green]Claude client initialized after package installation.[/green]")
-                    except Exception as e:
-                        console.print(f"[red]Could not initialize Claude client after installation: {e}[/red]")
-
-            elif choice.startswith("Brave Search API Key"):
-                 if not WEB_SEARCH_AVAILABLE:
-                      console.print("[yellow]Web Search module not found. Cannot configure Brave key.[/yellow]")
-                      continue
-                 self._update_api_key("BRAVE_API_KEY", "Brave Search")
-                 # No global vars to update here, module uses env directly
-
-            elif choice.startswith("SMS Configuration"):
-                 if not TWILIO_AVAILABLE:
-                      console.print("[yellow]Twilio library not installed. Please run: pip install twilio[/yellow]")
-                      continue
-                 self._configure_sms_settings()
-
-    def _update_api_key(self, env_var_name: str, service_name: str):
-        """Helper to update a specific API key."""
-        current_key = os.getenv(env_var_name) or ""
-        masked_key = "****" + current_key[-4:] if len(current_key) > 4 else ("Set" if current_key else "Not Set")
-
-        console.print(f"\nCurrent {service_name} API Key Status: [cyan]{masked_key}[/cyan]")
-
-        new_key = questionary.password(f"Enter new {service_name} API Key (leave blank to keep current, type 'REMOVE' to unset):").ask()
-
-        if new_key is None: # Handle Ctrl+C
-             console.print("Update cancelled.")
-             return
-
-        if new_key.strip().upper() == "REMOVE":
-             self._update_env_var(env_var_name, "") # Set to empty string
-             console.print(f"[bold yellow]{service_name} API Key removed.[/bold yellow]")
-        elif new_key.strip() == "":
-             console.print(f"{service_name} API Key unchanged.")
-        else:
-             self._update_env_var(env_var_name, new_key.strip())
-             console.print(f"[bold green]{service_name} API Key updated successfully.[/bold green]")
-
-
-    def _update_env_var(self, key: str, value: str) -> None:
-        """Update or add an environment variable in the .env file."""
-        env_path = Path(".env")
-        lines = []
-        key_found = False
-
-        if env_path.exists():
-            lines = env_path.read_text().splitlines()
-            for i, line in enumerate(lines):
-                stripped_line = line.strip()
-                if not stripped_line or stripped_line.startswith("#"):
-                    continue
-                # Basic parsing, handles keys without explicit '=' if value is empty
-                if stripped_line.startswith(f"{key}=") or (not value and stripped_line == key):
-                    lines[i] = f"{key}={value}" # Update existing line
-                    key_found = True
-                    break
-
-        if not key_found:
-            lines.append(f"{key}={value}") # Add new line
-
-        # Filter out potential empty lines caused by removal if needed
-        lines = [line for line in lines if line.strip()]
+                    console.print(f"[yellow]Failed to delete report '{report_filename}'.[/yellow]")
+            else:
+                console.print("Deletion cancelled.")
+        except Exception as e:
+            console.print(f"[red]Error during report deletion: {e}[/red]")
+    
+    def _send_report_sms(self, report_path: Path) -> None:
+        """Send a summary of the report via SMS using Twilio."""
+        if not TWILIO_ENABLED:
+            console.print("[red]Twilio is not configured. Cannot send SMS.[/red]")
+            return
 
         try:
-             env_path.write_text("\n".join(lines) + "\n") # Ensure trailing newline
-             os.environ[key] = value # Update live environment
+            # Read the report content
+            content = report_path.read_text(encoding='utf-8')
+            
+            # Clean escape sequences from content
+            try:
+                content = clean_escape_sequences(content)
+            except Exception as e:
+                console.print(f"[yellow]Warning: Error cleaning escape sequences: {e}[/yellow]")
+                # Apply direct cleaning if clean_escape_sequences fails
+                ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+                content = ansi_escape.sub('', content)
+                
+                # Also handle text representations of ESC
+                esc_text = re.compile(r'ESC\[(?:\d+;)*\d*[a-zA-Z]')
+                content = esc_text.sub('', content)
+            
+            # Extract title for SMS
+            metadata_result = parse_report_metadata(content)
+            if isinstance(metadata_result, tuple) and len(metadata_result) == 2:
+                metadata, content = metadata_result
+            else:
+                metadata = metadata_result
+            
+            title = metadata.get("title", report_path.stem)
+            
+            # Prepare SMS message
+            sms_message = f"New market research report available: {title}\n\n{content}"
+            
+            # Send SMS using Twilio
+            try:
+                client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                message = client.messages.create(
+                    to=TWILIO_PHONE_NUMBER,
+                    from_=TWILIO_PHONE_NUMBER,
+                    body=sms_message
+                )
+                console.print(f"[green]SMS sent successfully. SID: {message.sid}[/green]")
+            except Exception as e:
+                console.print(f"[red]Error sending SMS: {str(e)}[/red]")
         except Exception as e:
-             console.print(f"[red]Error writing to .env file: {e}[/red]")
-
+            console.print(f"[red]Error reading report for SMS: {str(e)}[/red]")
 
     def _configure_sms_settings(self) -> None:
-        """Configure Twilio SMS settings."""
-        if not TWILIO_AVAILABLE: # Should be checked before calling, but double-check
-             console.print("[red]Twilio library not found.[/red]")
-             return
-
-        console.print("\n[bold underline]Twilio SMS Configuration[/bold underline]")
-        account_sid = os.getenv("TWILIO_ACCOUNT_SID") or ""
-        auth_token = os.getenv("TWILIO_AUTH_TOKEN") or ""
-        phone_number = os.getenv("TWILIO_PHONE_NUMBER") or ""
-
-        masked_sid = "****" + account_sid[-4:] if len(account_sid) > 4 else ("Set" if account_sid else "Not Set")
-        masked_token = "****" + auth_token[-4:] if len(auth_token) > 4 else ("Set" if auth_token else "Not Set")
-
-        console.print(f"Account SID:       [cyan]{masked_sid}[/cyan]")
-        console.print(f"Auth Token:        [cyan]{masked_token}[/cyan]")
-        console.print(f"Twilio Phone No.:  [cyan]{phone_number or 'Not Set'}[/cyan]")
-
-        if questionary.confirm("Update Twilio settings?", default=False).ask():
-            new_sid = questionary.text("Enter Account SID:", default=account_sid).ask()
-            new_token = questionary.password("Enter Auth Token (leave blank to keep current):")
-            new_phone = questionary.text("Enter Twilio Phone Number (e.g., +15551234567):", default=phone_number).ask()
-
-            # Update only if values are provided or changed
-            if new_sid is not None: self._update_env_var("TWILIO_ACCOUNT_SID", new_sid)
-            if new_token: self._update_env_var("TWILIO_AUTH_TOKEN", new_token) # Only update token if provided
-            if new_phone is not None: self._update_env_var("TWILIO_PHONE_NUMBER", new_phone)
-
-            console.print("[bold green]Twilio settings updated.[/bold green]")
-
-            # Refresh global Twilio status
-            global TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, TWILIO_ENABLED
-            TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-            TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-            TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-            TWILIO_ENABLED = TWILIO_AVAILABLE and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER
-
-
-    def _send_report_sms(self, report_path: Path) -> None:
-        """Send a report summary via SMS."""
+        """Configure SMS settings using Twilio."""
         if not TWILIO_ENABLED:
-            console.print("[yellow]SMS functionality is not configured. Please set up Twilio in settings.[/yellow]")
+            console.print("[red]Twilio is not configured. Cannot configure SMS settings.[/red]")
             return
 
-        phone_number = questionary.text(
-             "Enter recipient's phone number (e.g., +1234567890):",
-             validate=lambda p: (p.startswith('+') and len(p) > 7 and p[1:].isdigit()) or p == ""
-             ).ask()
-
-        if not phone_number:
-            console.print("SMS sending cancelled.")
-            return
-
-        console.print(f"[bold]Sending report summary to {phone_number}...[/bold]")
-        success, message = send_report_via_sms(report_path, phone_number) # Call standalone function
-
-        if success:
-            console.print(f"[bold green]✓ SMS summary sent successfully to {phone_number}.[/bold green]")
-            console.print(f"   (Twilio SID: {message})")
-        else:
-            console.print(f"[bold red]✗ Failed to send SMS: {message}[/bold red]")
-
-
-    def _install_anthropic_package(self):
-        """Attempt to install the Anthropic (Claude) package."""
-        global CLAUDE_AVAILABLE, CLAUDE_API_KEY, CLAUDE_MESSAGES_API_AVAILABLE, claude_client
-        
-        console.print("\n[bold cyan]===== Anthropic Library Installation =====")
-        console.print("[yellow]This will install or update the 'anthropic' Python package required for Claude AI.[/yellow]")
-        
-        # Display current status
         try:
-            import pkg_resources
-            try:
-                current_version = pkg_resources.get_distribution("anthropic").version
-                console.print(f"[cyan]Current installed version: v{current_version}[/cyan]")
-            except pkg_resources.DistributionNotFound:
-                console.print("[yellow]Status: Not currently installed[/yellow]")
-        except ImportError:
-            console.print("[yellow]Status: Package information unavailable[/yellow]")
-            
-        console.print("[cyan]Attempting to install 'anthropic' library using pip...[/cyan]")
-        try:
-            import subprocess
-            import sys
-            
-            # Show installation progress
-            console.print("[cyan]Running: pip install -U anthropic[/cyan]")
-            
-            # Use check_call to raise error if install fails
-            result = subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "anthropic"]) # -U to upgrade
-            
-            # Check the installed version after installation
-            try:
-                import pkg_resources
-                import importlib
-                # Reload if it was already imported
-                if "anthropic" in sys.modules:
-                    importlib.reload(sys.modules["anthropic"])
-                new_version = pkg_resources.get_distribution("anthropic").version
-                console.print(f"[bold green]✓ Successfully installed/updated 'anthropic' package to v{new_version}![/bold green]")
-            except Exception:
-                console.print("[bold green]✓ Successfully installed/updated 'anthropic' package![/bold green]")
-                
-            # Import anthropic to check if it works
-            try:
-                import anthropic
-                console.print("[green]✓ Successfully imported 'anthropic' module[/green]")
-                CLAUDE_AVAILABLE = True
-                
-                # Check for the Messages API capabilities
-                if hasattr(anthropic, "Anthropic"):
-                    console.print("[green]✓ Modern Anthropic client detected[/green]")
-                    if CLAUDE_API_KEY:
-                        console.print("[cyan]Attempting to initialize client with your API key...[/cyan]")
-                        try:
-                            claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-                            if hasattr(claude_client, "messages") and callable(getattr(claude_client.messages, "create", None)):
-                                CLAUDE_MESSAGES_API_AVAILABLE = True
-                                console.print("[bold green]✓ Claude Messages API is available and ready to use![/bold green]")
-                            else:
-                                console.print("[yellow]⚠ Claude Messages API not detected. You may need a newer version.[/yellow]")
-                        except Exception as e:
-                            console.print(f"[yellow]⚠ Could not initialize Claude client: {e}[/yellow]")
-                    else:
-                        console.print("[yellow]⚠ Claude API key not set. Please set it to use Claude.[/yellow]")
-                else:
-                    console.print("[yellow]⚠ Unexpected Anthropic library structure. Check for updates.[/yellow]")
-                    
-            except ImportError:
-                console.print("[yellow]⚠ Package installed but import failed. This is unexpected.[/yellow]")
-                CLAUDE_AVAILABLE = False
-                
-            console.print("[yellow]You may need to restart the application for changes to take full effect.[/yellow]")
-            time.sleep(1) # Pause to let user read
+            # Get current settings
+            current_settings = {
+                "Account SID": TWILIO_ACCOUNT_SID,
+                "Auth Token": TWILIO_AUTH_TOKEN,
+                "Phone Number": TWILIO_PHONE_NUMBER
+            }
+            console.print("\n[bold]Current SMS Settings:[/bold]")
+            for key, value in current_settings.items():
+                console.print(f"{key}: {value}")
 
-        except subprocess.CalledProcessError as e:
-            console.print(f"[bold red]Failed to install 'anthropic': Pip command failed with error code {e.returncode}[/bold red]")
-            console.print(f"[red]Error details: {e}[/red]")
-            if e.returncode == 1:
-                console.print("[yellow]This might be due to network issues, permissions, or PyPI being unavailable.[/yellow]")
+            # Ask user for new settings
+            new_account_sid = questionary.text("Enter new Account SID (leave blank to keep current):", default=TWILIO_ACCOUNT_SID).ask()
+            new_auth_token = questionary.text("Enter new Auth Token (leave blank to keep current):", default=TWILIO_AUTH_TOKEN).ask()
+            new_phone_number = questionary.text("Enter new Phone Number (leave blank to keep current):", default=TWILIO_PHONE_NUMBER).ask()
+
+            # Update settings if provided
+            if new_account_sid:
+                TWILIO_ACCOUNT_SID = new_account_sid
+            if new_auth_token:
+                TWILIO_AUTH_TOKEN = new_auth_token
+            if new_phone_number:
+                TWILIO_PHONE_NUMBER = new_phone_number
+
+            # Save settings to environment variables
+            os.environ["TWILIO_ACCOUNT_SID"] = TWILIO_ACCOUNT_SID
+            os.environ["TWILIO_AUTH_TOKEN"] = TWILIO_AUTH_TOKEN
+            os.environ["TWILIO_PHONE_NUMBER"] = TWILIO_PHONE_NUMBER
+
+            console.print("\n[bold green]SMS settings updated successfully![/bold green]")
         except Exception as e:
-            console.print(f"[bold red]An unexpected error occurred during installation: {str(e)}[/bold red]")
-            console.print("[yellow]You may need to install it manually with: pip install --upgrade anthropic[/yellow]")
-            
-        # Wait for user acknowledgment before returning
-        questionary.press_any_key_to_continue(message="Press any key to return to settings...").ask()
-
+            console.print(f"[red]Error updating SMS settings: {str(e)}[/red]")
 
     def show_help(self) -> None:
-        """Display help information and AI model comparison."""
-        help_title = "[bold blue]Market Research Generator - Help & Information[/bold blue]"
+        """Display help information about the tool and its usage."""
+        console.print("\n[bold]Help & Information:[/bold]")
+        console.print("This tool helps you generate market research reports using AI.")
+        console.print("You can choose to use OpenAI or Claude for generating sections.")
+        console.print("The tool will guide you through the process step-by-step.")
+        console.print("Please ensure your API keys are configured correctly in the `.env` file.")
+        console.print("For more information, please refer to the documentation.")
 
-        model_comparison = """
-[bold underline]AI Model Strategies[/bold underline]
-This tool leverages powerful AI models for report generation. You can choose a strategy:
-
-[bold]Balanced (Recommended):[/bold]
-• Uses the most suitable AI (OpenAI or Claude) for each research stage.
-• Aims for the highest quality by combining model strengths.
-• [i]Requires both OpenAI and Claude to be configured.[/i]
-• If the preferred model for a stage fails, generation stops.
-
-[bold]OpenAI Only (Strict):[/bold]
-• Uses OpenAI (GPT-4/GPT-3.5) for all stages.
-• Good for strong data analysis and structured summaries.
-• [i]Requires OpenAI to be configured.[/i]
-• If OpenAI fails at any point, generation stops.
-
-[bold]Claude Only (Strict):[/bold]
-• Uses Claude (Claude 3 Sonnet) for all stages.
-• Excels at nuanced analysis, risk assessment, and context-rich explanations.
-• [i]Requires a correctly configured Claude setup (API key + up-to-date library).[/i]
-• If Claude fails at any point, generation stops.
-
-[bold yellow]Strict Failure:[/bold yellow] With 'OpenAI Only' or 'Claude Only', or if a model fails in 'Balanced' mode, the report generation will halt immediately to ensure adherence to your preference and prevent incomplete reports with mixed/fallback content.
-"""
-
-        usage_help = """
-[bold underline]Getting Started[/bold underline]
-1.  [bold]Configure APIs:[/bold] Go to 'Settings' and add your API keys for OpenAI and/or Claude. Install libraries if prompted. Brave Search key is optional for web enrichment.
-2.  [bold]Generate Report:[/bold] Select 'Generate...', choose category/topic, focus, and your preferred AI model strategy.
-3.  [bold]View/Manage:[/bold] Use 'View' or 'Delete' options for saved reports (in the 'reports' folder).
-4.  [bold]SMS (Optional):[/bold] Configure Twilio in 'Settings' to send report summaries.
-"""
-
-        console.print(Panel(model_comparison, title=help_title, border_style="blue", expand=False))
-        console.print(Panel(usage_help, title="[bold cyan]How to Use[/bold cyan]", border_style="cyan", expand=False))
-
-        # Show current configuration status again for context
-        self.display_welcome() # Re-display welcome which includes status
-
-        questionary.press_any_key_to_continue(message="Press any key to return to the main menu...").ask()
-
-
-# --- Standalone Functions ---
-
-def view_report(report_path: Path, console: Console) -> None:
-    """View a specific report file in the console using Markdown rendering."""
+# Add view_report function at the top level before any usage
+def view_report(report_path: Path, console: Any) -> None:
+    """View a specific report file in the console using Markdown rendering.
+    
+    This is a standalone function that cleans escape sequences and displays formatted report content.
+    
+    Args:
+        report_path: Path to the report file
+        console: Rich console object for display
+    """
     if not report_path.exists():
         console.print(f"[red]Error: Report file not found at {report_path}[/red]")
         return
@@ -1702,191 +1979,64 @@ def view_report(report_path: Path, console: Console) -> None:
     try:
         content = report_path.read_text(encoding='utf-8')
         
-        # Clean any ANSI escape sequences that might be present in the content
+        # Clean any ANSI escape sequences in the content
         try:
-            # Always use the Python wrapper which has proper fallback handling
             content = clean_escape_sequences(content)
         except Exception as e:
-            # If even that fails, try direct regex cleaning
-            console.print(f"[yellow]Warning: Could not use clean_escape_sequences: {str(e)}. Using direct regex.[/yellow]")
-            try:
-                escape_seq_pattern = re.compile(r'(?:\x1B|\bESC)(?:\[|\(|\))[^@-Z\\^_`a-z{|}~]*[@-Z\\^_`a-z{|}~]')
-                content = escape_seq_pattern.sub('', content)
-            except Exception as inner_e:
-                console.print(f"[yellow]Warning: Could not clean escape sequences: {str(inner_e)}[/yellow]")
+            console.print(f"[yellow]Warning: Error cleaning escape sequences: {str(e)}[/yellow]")
+            # Apply direct cleaning if clean_escape_sequences fails
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            content = ansi_escape.sub('', content)
             
-        metadata = parse_report_metadata(content) # Use Rust/Python parser
-        title = metadata.get("title", report_path.stem)
-        date = metadata.get("date", "N/A")
-        report_id = metadata.get("id", "N/A")
-
-        # Display header info
-        console.print(f"\n[bold blue]--- Viewing Report ---[/bold blue]")
-        console.print(f"[bold]Title:[/bold] [green]{title}[/green]")
-        console.print(f"[bold]Generated:[/bold] {date}")
-        console.print(f"[bold]ID:[/bold] {report_id}")
-        console.print(f"[bold]File:[/bold] {report_path.name}")
-        console.print("-" * 20)
-
-        # Render Markdown content within a pager
-        md = Markdown(content)
-        # Use console.pager for long content
-        with console.pager(styles=True):
-             console.print(md)
-
-        console.print("[bold blue]--- End of Report ---[/bold blue]")
-
-    except Exception as e:
-        console.print(f"[bold red]Error reading or displaying report {report_path.name}: {str(e)}[/bold red]")
-        console.print_exception(show_locals=False) # Show traceback for debugging
-
-
-def send_report_via_sms(report_path: Path, phone_number: str) -> tuple[bool, str]:
-    """Sends a summary of the report via SMS using Twilio."""
-    if not TWILIO_ENABLED:
-        return False, "Twilio is not configured or enabled."
-
-    try:
-        # Initialize Twilio client
-        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-        # Read report and extract metadata/summary
-        content = report_manager.read_report(report_path.name)
-        metadata = parse_report_metadata(content)
-        title = metadata.get("title", report_path.stem)
-
-        # Create a concise summary message (simple version)
-        # In a real app, you might use an AI to summarize the executive summary section
-        summary = f"Market Research Summary: {title}\n\n"
-        # Find Executive Summary section if it exists
-        exec_summary_start = content.find("## Executive Summary")
-        if exec_summary_start != -1:
-             next_section_start = content.find("\n## ", exec_summary_start + 20)
-             summary_text = content[exec_summary_start + 20 : next_section_start if next_section_start != -1 else None].strip()
-             # Limit length for SMS
-             max_len = 1500 # Approximate max length for multi-part SMS
-             if len(summary_text) > max_len:
-                  summary_text = summary_text[:max_len] + "..."
-             summary += summary_text + "\n\n(Full report available)"
+            # Also handle text representations of ESC
+            esc_text = re.compile(r'ESC\[(?:\d+;)*\d*[a-zA-Z]')
+            content = esc_text.sub('', content)
+        
+        # Extract title for display
+        metadata_result = parse_report_metadata(content)
+        if isinstance(metadata_result, tuple) and len(metadata_result) == 2:
+            metadata, content = metadata_result
         else:
-             summary += "(Full report available in generated file.)"
-
-
-        # Send the SMS
-        message = client.messages.create(
-            body=summary,
-            from_=TWILIO_PHONE_NUMBER,
-            to=phone_number
-        )
-        return True, message.sid # Return success and message SID
-
-    except Exception as e:
-        console.print_exception(show_locals=False) # Log full error for debugging
-        return False, f"Twilio API error: {str(e)}"
-
-
-# --- Typer CLI Command and Main Execution ---
-
-# Note: The Typer command `cli` below is designed for non-interactive execution.
-# The main interactive loop is handled by `FastCLI` instances called from `main()`.
-@app.command()
-def run(headless: bool = typer.Option(False, "--headless", help="Run in headless mode (non-interactive)"),
-        topic: str = typer.Option(None, "--topic", help="Topic for market research (required in headless)"),
-        category: str = typer.Option("Custom", "--category", help="Category for market research"),
-        focus: str = typer.Option("all", "--focus", help="Research focus areas (comma-separated, e.g., 'Market size,Competitive landscape') or 'all'"),
-        model: str = typer.Option("balanced", "--model", help="AI model strategy (balanced, openai, claude)"),
-        length: str = typer.Option("Standard", "--length", help="Report detail level (Concise, Standard, Comprehensive) - currently informational"),
-        out_dir: str = typer.Option(None, "--out-dir", help="Output directory for reports (defaults to './reports')"),
-        use_web_search: bool = typer.Option(False, "--use-web-search", "-w", help="Enable real-time web search")):
-    """
-    Market Research Generator CLI.
-
-    Run without arguments for interactive mode.
-    Use --headless with --topic for automated generation.
-    """
-    global REPORTS_DIR, report_manager # Allow modification of global report path
-
-    if out_dir:
-        reports_path = Path(out_dir)
+            metadata = metadata_result
+        
+        title = metadata.get("title", report_path.stem)
+        
+        # Display the report with markdown formatting
+        console.print("\n")
+        console.rule(f"[bold blue]{title}[/bold blue]", style="blue")
+        console.print("\n")
+        
+        # Display content with markdown formatting if available
         try:
-             reports_path.mkdir(parents=True, exist_ok=True)
-             REPORTS_DIR = reports_path
-             # Re-initialize report manager with the new path
-             if is_rust_enabled:
-                  report_manager = ReportManager(str(REPORTS_DIR))
-             else:
-                  report_manager = BasicReportManager(str(REPORTS_DIR))
-             console.print(f"[info]Using output directory: {REPORTS_DIR}[/info]")
-        except Exception as e:
-             console.print(f"[red]Error setting output directory '{out_dir}': {e}. Using default './reports'.[/red]")
-             REPORTS_DIR = Path("reports") # Fallback
-             REPORTS_DIR.mkdir(exist_ok=True)
-             # Initialize with default path again
-             if is_rust_enabled: report_manager = ReportManager(str(REPORTS_DIR))
-             else: report_manager = BasicReportManager(str(REPORTS_DIR))
-    else:
-        REPORTS_DIR.mkdir(exist_ok=True) # Ensure default exists
-
-
-    if headless:
-        # --- Headless Mode Execution ---
-        if not topic:
-            console.print("[bold red]Error: In headless mode, --topic is required.[/bold red]")
-            raise typer.Exit(code=1)
-
-        console.print("[bold]Running in headless mode[/bold]")
-        console.print(f"[info]Topic: {topic}, Category: {category}, Model: {model}, WebSearch: {use_web_search}[/info]")
-
-        # Validate model choice based on availability
-        model_preference = model.lower()
-        if model_preference not in ["balanced", "openai", "claude"]:
-             console.print(f"[yellow]Warning: Invalid model preference '{model}'. Using 'balanced'.[/yellow]")
-             model_preference = "balanced"
-
-        # Check if chosen model is usable
-        if model_preference == "openai" and not OPENAI_API_KEY:
-            console.print("[bold red]Error: Headless mode chose 'openai', but key is missing.[/bold red]")
-            raise typer.Exit(code=1)
-        if model_preference == "claude" and (not CLAUDE_API_KEY or not CLAUDE_AVAILABLE or not hasattr(claude_client, "messages")):
-             console.print("[bold red]Error: Headless mode chose 'claude', but it's not configured or library is incompatible.[/bold red]")
-             raise typer.Exit(code=1)
-        # Add balanced check if needed
-
-
-        # Simple progress callback for headless stdout
-        def headless_progress(percentage, stage, agent, activity):
-            console.print(f"PROGRESS: {percentage:.1f}% | Stage: {stage} | Agent: {agent} | Activity: {activity}")
-
-        # Generate report directly
-        report_content = generate_market_research_report(
-            topic=topic,
-            progress_callback=headless_progress,
-            model_preference=model_preference,
-            use_web_search=use_web_search
-        )
-
-        if report_content is None:
-            console.print("[bold red]Headless report generation failed.[/bold red]")
-            raise typer.Exit(code=1)
-        else:
-            # Save the report
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            file_name = f"{category.lower()}_{topic.lower().replace(' ', '_').replace('/','_')}_{timestamp}.md"
-            try:
-                 file_path = report_manager.save_report(file_name, report_content)
-                 console.print(f"\n[bold green]Report successfully generated and saved to:[/bold green] {file_path}")
-            except Exception as e:
-                 console.print(f"[bold red]Report generated but failed to save: {e}[/bold red]")
-                 # Optionally print content to stdout if saving fails?
-                 # rprint(Panel(Markdown(report_content), title="Generated Report Content"))
-                 raise typer.Exit(code=1) # Exit with error if save fails
-
-    else:
-        # --- Interactive Mode Execution ---
-        cli_instance = FastCLI()
-        cli_instance.display_welcome()
-        cli_instance.main_menu()
-
+            from rich.markdown import Markdown
+            md = Markdown(content)
+            console.print(md)
+        except ImportError:
+            # Fallback to simple printing if markdown formatter not available
+            console.print(content)
+            
+        console.print("\n")
+        console.rule(style="blue")
+        console.print("\n")
+        
+    except Exception as e:
+        console.print(f"[red]Error viewing report: {str(e)}[/red]")
+        console.print(f"[yellow]Try using the test_view_report.py script as an alternative[/yellow]")
 
 if __name__ == "__main__":
-    app()
+    print("=== Debug: Starting application ===")
+    try:
+        # Don't call app() directly, which causes Typer error
+        # Instead, create a CLI instance and start interactive mode
+        print("=== Debug: Creating CLI instance ===")
+        cli_instance = FastCLI()
+        print("=== Debug: Displaying welcome ===")
+        cli_instance.display_welcome()
+        print("=== Debug: Entering main menu ===")
+        cli_instance.main_menu()
+        print("=== Debug: Application completed normally ===")
+    except Exception as e:
+        print(f"=== Debug: Unhandled exception: {e} ===")
+        import traceback
+        traceback.print_exc()
+    print("=== Debug: Reached end of file ===")
