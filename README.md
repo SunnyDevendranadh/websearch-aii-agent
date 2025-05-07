@@ -6,6 +6,8 @@
 
 A sophisticated CLI tool for generating comprehensive market research reports using advanced AI models. Featuring Rust acceleration for performance-critical operations and enhanced with real-time web search capabilities, this tool delivers professional-quality market analysis for any topic.
 
+This project was developed by Sunny Devendrandh Karri as a final project for IS-170. I am grateful to Professor Choi for assigning this fascinating challenge. The project not only taught us how to work with AI agents but also helped us understand their importance and exposed us to career opportunities in this field.
+
 ![Market Research Agent Demo](docs/images/demo.gif)
 
 ## 🔑 Key Features
