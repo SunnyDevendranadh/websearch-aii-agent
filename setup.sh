@@ -70,7 +70,7 @@ pip install reportlab --upgrade
 # Build and install the Rust backend
 echo "🔨 Building Rust performance backend..."
 if [ -d "market_research_cli/market_research_core" ]; then
-    cd market_research_cli/market_research_core
+cd market_research_cli/market_research_core
     # Check if maturin is installed
     if ! command -v maturin &>/dev/null; then
         echo "📦 Installing Maturin build tool..."
@@ -78,11 +78,11 @@ if [ -d "market_research_cli/market_research_core" ]; then
     fi
     
     echo "🚀 Building Rust library..."
-    maturin build --release
+maturin build --release
     
     echo "📦 Installing Rust library..."
-    pip install target/wheels/market_research_core-*.whl
-    cd ../..
+pip install target/wheels/market_research_core-*.whl
+cd ../..
     echo "✅ Rust backend successfully built and installed"
 else
     echo "⚠️ Rust core directory not found, skipping Rust backend build"

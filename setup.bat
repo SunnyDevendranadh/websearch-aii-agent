@@ -72,7 +72,7 @@ pip install reportlab --upgrade
 REM Build and install the Rust backend
 echo [!] Building Rust performance backend...
 if exist market_research_cli\market_research_core (
-    cd market_research_cli\market_research_core
+cd market_research_cli\market_research_core
     
     REM Check if maturin is installed
     pip show maturin >nul 2>&1
@@ -82,11 +82,11 @@ if exist market_research_cli\market_research_core (
     )
     
     echo [!] Building Rust library...
-    maturin build --release
+maturin build --release
     
     echo [!] Installing Rust library...
-    pip install target\wheels\market_research_core-*-win_amd64.whl
-    cd ..\..
+pip install target\wheels\market_research_core-*-win_amd64.whl
+cd ..\..
     echo [✓] Rust backend successfully built and installed
 ) else (
     echo [!] Rust core directory not found, skipping Rust backend build

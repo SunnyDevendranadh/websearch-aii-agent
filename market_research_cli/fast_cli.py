@@ -1693,7 +1693,7 @@ class FastCLI:
         except ImportError:
             console.print("[yellow]ReportLab library not found. PDF export will attempt to use alternatives.[/yellow]")
             reportlab_available = False
-        
+            
         # Create a list of report options with index and title/date
         report_options = []
         for i, report_filename in enumerate(reports):
@@ -1961,6 +1961,162 @@ class FastCLI:
         console.print("The tool will guide you through the process step-by-step.")
         console.print("Please ensure your API keys are configured correctly in the `.env` file.")
         console.print("For more information, please refer to the documentation.")
+
+    def settings(self) -> None:
+        """Configure application settings."""
+        console.print("\n[bold blue]===== Settings Menu =====[/bold blue]")
+        
+        # Define available settings options
+        settings_options = [
+            "Configure API Keys",
+            "Configure SMS Settings",
+            "Return to Main Menu"
+        ]
+        
+        # Display settings menu using questionary
+        try:
+            choice = questionary.select(
+                "What would you like to configure?",
+                choices=settings_options,
+                qmark=">",
+                use_indicator=True,
+                use_shortcuts=True,
+                use_arrow_keys=True
+            ).ask()
+        except Exception as e:
+            console.print(f"[yellow]Warning: Interactive selection failed: {str(e)}[/yellow]")
+            # Fallback to simple input
+            for i, option in enumerate(settings_options, 1):
+                console.print(f"  {i}. {option}")
+            console.print("Enter the number of your choice (1-3): ", end="")
+            user_input = input().strip()
+            if user_input.isdigit() and 1 <= int(user_input) <= 3:
+                choice = settings_options[int(user_input) - 1]
+            else:
+                console.print("[red]Invalid input. Returning to main menu.[/red]")
+                return
+        
+        # Handle user choice
+        if choice == "Configure API Keys" or choice == "1":
+            self._configure_api_keys()
+        elif choice == "Configure SMS Settings" or choice == "2":
+            self._configure_sms_settings()
+        elif choice == "Return to Main Menu" or choice == "3":
+            console.print("[green]Returning to main menu...[/green]")
+            return
+    
+    def _configure_api_keys(self) -> None:
+        """Configure API keys for OpenAI, Claude, and Brave Search."""
+        console.print("\n[bold]API Key Configuration[/bold]")
+        
+        # Display current API keys (masked for security)
+        current_keys = {
+            "OpenAI API Key": os.getenv("OPENAI_API_KEY", "Not set"),
+            "Claude API Key": os.getenv("ANTHROPIC_API_KEY", "Not set"),
+            "Brave Search API Key": os.getenv("BRAVE_API_KEY", "Not set")
+        }
+        
+        # Mask keys for display
+        masked_keys = {}
+        for key_name, key_value in current_keys.items():
+            if key_value != "Not set" and len(key_value) > 8:
+                masked_keys[key_name] = key_value[:4] + "*" * (len(key_value) - 8) + key_value[-4:]
+            else:
+                masked_keys[key_name] = key_value
+        
+        console.print("\n[bold]Current API Keys:[/bold]")
+        for key_name, masked_value in masked_keys.items():
+            icon = "✅" if masked_value != "Not set" else "❌"
+            console.print(f"{icon} {key_name}: {masked_value}")
+        
+        # Ask which key to configure
+        api_key_options = [
+            "OpenAI API Key",
+            "Claude API Key (Anthropic)",
+            "Brave Search API Key",
+            "Cancel"
+        ]
+        
+        try:
+            key_choice = questionary.select(
+                "Which API key would you like to configure?",
+                choices=api_key_options,
+                qmark=">",
+                use_shortcuts=True
+            ).ask()
+        except Exception:
+            console.print("[yellow]Interactive selection failed. Returning to settings menu.[/yellow]")
+            return
+        
+        if key_choice == "Cancel":
+            console.print("[green]Returning to settings menu...[/green]")
+            return
+        
+        # Get new API key value
+        env_var_name = ""
+        if key_choice == "OpenAI API Key":
+            env_var_name = "OPENAI_API_KEY"
+        elif key_choice == "Claude API Key (Anthropic)":
+            env_var_name = "ANTHROPIC_API_KEY"
+        elif key_choice == "Brave Search API Key":
+            env_var_name = "BRAVE_API_KEY"
+        
+        new_value = questionary.password(
+            f"Enter new {key_choice} value (press Enter to keep current):",
+        ).ask()
+        
+        if not new_value:
+            console.print("[yellow]No change made.[/yellow]")
+            return
+        
+        # Update environment variable and .env file
+        try:
+            # Update in-memory environment variable
+            os.environ[env_var_name] = new_value
+            
+            # Update .env file if it exists
+            env_file = Path(".env")
+            if env_file.exists():
+                env_contents = env_file.read_text()
+                
+                # Check if variable exists in file
+                if f"{env_var_name}=" in env_contents:
+                    # Replace existing value
+                    line_pattern = re.compile(f"^{env_var_name}=.*$", re.MULTILINE)
+                    new_contents = line_pattern.sub(f"{env_var_name}={new_value}", env_contents)
+                else:
+                    # Add new variable at the end
+                    new_contents = env_contents.rstrip() + f"\n{env_var_name}={new_value}\n"
+                
+                # Write updated content back to file
+                env_file.write_text(new_contents)
+                console.print(f"[green]✓ {key_choice} updated successfully![/green]")
+            else:
+                # Create new .env file
+                env_file.write_text(f"{env_var_name}={new_value}\n")
+                console.print(f"[green]✓ {key_choice} set and .env file created![/green]")
+                
+            # If this is OpenAI or Claude, let's notify about model availability change
+            if env_var_name == "OPENAI_API_KEY":
+                global OPENAI_API_KEY
+                OPENAI_API_KEY = new_value
+                console.print("[green]✓ OpenAI models are now available.[/green]")
+            elif env_var_name == "ANTHROPIC_API_KEY":
+                # Reinitialize Claude client
+                if CLAUDE_AVAILABLE:
+                    global CLAUDE_API_KEY, claude_client
+                    CLAUDE_API_KEY = new_value
+                    # Attempt to reinitialize claude client
+                    try:
+                        claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+                        console.print("[green]✓ Claude models are now available.[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠ Could not initialize Claude client: {str(e)}[/yellow]")
+                else:
+                    console.print("[yellow]⚠ Claude API library ('anthropic') not installed. Claude models unavailable despite key update.[/yellow]")
+            
+        except Exception as e:
+            console.print(f"[red]Error updating API key: {str(e)}[/red]")
 
 # Add view_report function at the top level before any usage
 def view_report(report_path: Path, console: Any) -> None:
